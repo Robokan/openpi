@@ -1,0 +1,60 @@
+# Docker Compose for openpi with NGC-optimized JAX
+#
+# Run with:
+#   docker compose -f scripts/docker/compose_ngc.yml up --build
+#
+# Or interactively:
+#   docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc /bin/bash
+#
+# For DGX Spark training:
+#   cd ~/openpi
+#   docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
+#       python scripts/train.py pi05_openarm --exp-name spark_v1
+
+services:
+  openpi_server_ngc:
+    image: openpi_server_ngc
+    build:
+      context: ../..
+      dockerfile: scripts/docker/serve_policy_ngc.Dockerfile
+    init: true
+    tty: true
+    stdin_open: true
+    network_mode: host
+    
+    volumes:
+      # Mount the project directory
+      - $PWD:/app
+      # Mount checkpoint cache
+      - ${OPENPI_DATA_HOME:-~/.cache/openpi}:/openpi_assets
+      # Mount HuggingFace cache for datasets
+      - ${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface
+      # Mount local datasets directory (for OpenArms/custom data)
+      - ${DATASETS_DIR:-~/datasets}:/datasets
+    
+    environment:
+      - SERVER_ARGS
+      - OPENPI_DATA_HOME=/openpi_assets
+      - HF_HOME=/root/.cache/huggingface
+      - IS_DOCKER=true
+      # JAX memory settings - lower fraction to leave headroom for checkpoint saves
+      # On unified memory (DGX Spark), we need ~20-30GB free for serialization
+      - XLA_PYTHON_CLIENT_MEM_FRACTION=0.7
+      # Preallocate memory to avoid fragmentation issues
+      - XLA_PYTHON_CLIENT_PREALLOCATE=true
+      # Persistent compilation cache - speeds up subsequent runs
+      - JAX_COMPILATION_CACHE_DIR=/app/.jax_cache
+      # Enable TF32 for better performance on Ampere+ GPUs
+      - NVIDIA_TF32_OVERRIDE=1
+
+    # GPU access
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+    # Override default command for interactive use
+    # command: /bin/bash

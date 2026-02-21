@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.openarm_policy as openarm_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -65,6 +66,8 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Local directory containing the LeRobot dataset. If set, loads from local disk instead of HuggingFace Hub.
+    local_dir: str | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -262,6 +265,64 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
         )
         if self.use_delta_joint_actions:
             delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotOpenArmDataConfig(DataConfigFactory):
+    """Data config for OpenArm bimanual robot (7-DOF per arm + gripper = 16 total DOF).
+    
+    OpenArm uses LeRobot format with:
+    - State/Action: [left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)]
+    - Cameras: ego (overhead), left_wrist, right_wrist
+    """
+    
+    use_delta_joint_actions: bool = True
+    default_prompt: str | None = None
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high": "observation.images.ego",
+                            "cam_left_wrist": "observation.images.left_wrist",
+                            "cam_right_wrist": "observation.images.right_wrist",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",  # Preserve prompt through repack
+                    }
+                )
+            ]
+        )
+    )
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[openarm_policy.OpenArmInputs()],
+            outputs=[openarm_policy.OpenArmOutputs()],
+        )
+        if self.use_delta_joint_actions:
+            # OpenArm: 7 arm joints (delta) + 1 gripper (absolute) per arm
+            # Pattern: [7 delta, 1 abs, 7 delta, 1 abs]
+            delta_action_mask = _transforms.make_bool_mask(7, -1, 7, -1)
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
@@ -929,6 +990,79 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
+    ),
+    TrainConfig(
+        name="pi05_aloha_sim",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="lerobot/aloha_sim_transfer_cube_human",
+            default_prompt="Transfer cube",
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+    ),
+    TrainConfig(
+        name="pi05_openarm",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotOpenArmDataConfig(
+            repo_id="openarm-teleop",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_dir="/home/evaughan/datasets/vla_teleop_data_lerobot",
+            ),
+            assets=AssetsConfig(asset_id="openarm"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=16,  # Smaller batch for small dataset (7 episodes)
+    ),
+    # NGC container version - uses /datasets mount point
+    # Batch size reduced to 2 to avoid OOM on GB10 (unified memory system)
+    TrainConfig(
+        name="pi05_openarm_ngc",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotOpenArmDataConfig(
+            repo_id="openarm-teleop",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_dir="/datasets/vla_teleop_data_lerobot",
+            ),
+            assets=AssetsConfig(asset_id="openarm"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=2,
+    ),
+    # NGC container version with LoRA - much lower memory usage
+    # Only trains small adapter layers, freezes the rest of the 3B model
+    TrainConfig(
+        name="pi05_openarm_ngc_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotOpenArmDataConfig(
+            repo_id="openarm-teleop",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_dir="/datasets/vla_teleop_data_lerobot",
+            ),
+            assets=AssetsConfig(asset_id="openarm"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        # Freeze all parameters except LoRA adapters
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning (saves memory)
+        ema_decay=None,
+        num_train_steps=30_000,
+        batch_size=2,  # Minimal batch size to maximize headroom for checkpoint saves
+        save_interval=1000,  # Standard interval - save every 1000 steps
     ),
     #
     # Debugging configs.

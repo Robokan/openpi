@@ -4,9 +4,11 @@ import asyncio
 import concurrent.futures as futures
 import dataclasses
 import logging
+import re
 from typing import Protocol
 
 from etils import epath
+import flax.traverse_util
 import jax
 import orbax.checkpoint as ocp
 import orbax.checkpoint.future as future
@@ -15,6 +17,10 @@ from openpi.shared import array_typing as at
 import openpi.shared.normalize as _normalize
 import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
+
+
+# Flag to enable LoRA-only checkpoint saving (saves memory on unified memory systems)
+SAVE_LORA_ONLY = True
 
 
 def initialize_checkpoint_dir(
@@ -37,12 +43,18 @@ def initialize_checkpoint_dir(
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    # Limit concurrent GB during save/restore to prevent RAM OOM on unified memory systems
+    # See: https://github.com/Physical-Intelligence/openpi/issues/827
+    pytree_handler = ocp.PyTreeCheckpointHandler(
+        save_concurrent_gb=16,  # With LoRA-only saves, checkpoints are small (~100MB) so this is plenty
+        restore_concurrent_gb=16,
+    )
     mngr = ocp.CheckpointManager(
         checkpoint_dir,
         item_handlers={
             "assets": CallbackHandler(),
-            "train_state": ocp.PyTreeCheckpointHandler(),
-            "params": ocp.PyTreeCheckpointHandler(),
+            "train_state": pytree_handler,
+            "params": pytree_handler,
         },
         options=ocp.CheckpointManagerOptions(
             max_to_keep=1,
@@ -62,6 +74,32 @@ def initialize_checkpoint_dir(
     return mngr, resuming
 
 
+def _filter_lora_params(params: at.Params) -> at.Params:
+    """Filter params to only include LoRA weights (params with 'lora' in their path).
+    
+    This dramatically reduces checkpoint size and memory usage during save.
+    """
+    flat = flax.traverse_util.flatten_dict(params, sep="/")
+    lora_pattern = re.compile(r".*lora.*", re.IGNORECASE)
+    filtered = {k: v for k, v in flat.items() if lora_pattern.match(k)}
+    
+    if not filtered:
+        logging.warning("No LoRA params found - saving empty params dict. "
+                       "This is expected if not using LoRA fine-tuning.")
+        return {}
+    
+    logging.info(f"Filtered to {len(filtered)} LoRA param tensors for checkpoint save")
+    return flax.traverse_util.unflatten_dict(filtered, sep="/")
+
+
+def _filter_lora_opt_state(opt_state) -> dict:
+    """Filter optimizer state to only include LoRA-related entries."""
+    # Optimizer state is a nested structure - we need to filter it carefully
+    # For simplicity, we'll just save the step count and let optimizer reinitialize
+    # The LoRA weights themselves are the important part
+    return {"step": getattr(opt_state, "count", 0) if hasattr(opt_state, "count") else 0}
+
+
 def save_state(
     checkpoint_manager: ocp.CheckpointManager,
     state: training_utils.TrainState,
@@ -75,14 +113,36 @@ def save_state(
         if norm_stats is not None and data_config.asset_id is not None:
             _normalize.save(directory / data_config.asset_id, norm_stats)
 
+    # Clear JAX caches before save to free up memory for checkpoint serialization
+    # This helps prevent OOM on unified memory systems like DGX Spark
+    jax.clear_caches()
+    
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():
         train_state, params = _split_params(state)
-    items = {
-        "assets": save_assets,
-        "train_state": train_state,
-        "params": {"params": params},
-    }
+    
+    # If SAVE_LORA_ONLY is enabled, filter to only save LoRA weights
+    # This dramatically reduces memory usage during checkpoint save
+    if SAVE_LORA_ONLY:
+        logging.info("Saving LoRA-only checkpoint (SAVE_LORA_ONLY=True)")
+        params = _filter_lora_params(params)
+        # For train_state, we save minimal info since optimizer state is large
+        # The full optimizer state will be reinitialized on resume
+        minimal_train_state = {
+            "step": int(train_state.step),
+        }
+        items = {
+            "assets": save_assets,
+            "train_state": minimal_train_state,
+            "params": {"params": params},
+        }
+    else:
+        items = {
+            "assets": save_assets,
+            "train_state": train_state,
+            "params": {"params": params},
+        }
+    
     checkpoint_manager.save(step, items)
 
 
