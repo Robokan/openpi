@@ -1,6 +1,7 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
 from typing import Any
 
@@ -15,6 +16,9 @@ import numpy as np
 import optax
 import tqdm_loggable.auto as tqdm
 import wandb
+
+# If set, exit after first training step to prime the XLA cache
+PRIME_XLA_CACHE = os.environ.get("PRIME_XLA_CACHE", "").lower() in ("1", "true", "yes")
 
 import openpi.models.model as _model
 import openpi.shared.array_typing as at
@@ -200,7 +204,10 @@ def main(config: _config.TrainConfig):
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
 
-    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+    # Use JAX_COMPILATION_CACHE_DIR env var if set, otherwise default to ~/.cache/jax
+    cache_dir = os.environ.get("JAX_COMPILATION_CACHE_DIR", str(epath.Path("~/.cache/jax").expanduser()))
+    jax.config.update("jax_compilation_cache_dir", cache_dir)
+    logging.info(f"JAX compilation cache directory: {cache_dir}")
 
     rng = jax.random.key(config.seed)
     train_rng, init_rng = jax.random.split(rng)
@@ -260,6 +267,14 @@ def main(config: _config.TrainConfig):
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
+        
+        # If PRIME_XLA_CACHE is set, exit after first step to save the compilation cache
+        if PRIME_XLA_CACHE and step == start_step:
+            logging.info("PRIME_XLA_CACHE=1: Exiting after first step to save XLA compilation cache")
+            logging.info("Run again without PRIME_XLA_CACHE to continue training with cached compilation")
+            # Block until computation is done, then exit cleanly
+            jax.block_until_ready(train_state)
+            return
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))

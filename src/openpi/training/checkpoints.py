@@ -20,7 +20,8 @@ import openpi.training.utils as training_utils
 
 
 # Flag to enable LoRA-only checkpoint saving (saves memory on unified memory systems)
-SAVE_LORA_ONLY = True
+# Disabled for now - standard saving should work with XLA_PYTHON_CLIENT_MEM_FRACTION=0.7
+SAVE_LORA_ONLY = False
 
 
 def initialize_checkpoint_dir(
@@ -79,7 +80,13 @@ def _filter_lora_params(params: at.Params) -> at.Params:
     
     This dramatically reduces checkpoint size and memory usage during save.
     """
-    flat = flax.traverse_util.flatten_dict(params, sep="/")
+    # Convert flax.nnx.State to pure dict if necessary
+    if hasattr(params, 'to_pure_dict'):
+        params_dict = params.to_pure_dict()
+    else:
+        params_dict = params
+    
+    flat = flax.traverse_util.flatten_dict(params_dict, sep="/")
     lora_pattern = re.compile(r".*lora.*", re.IGNORECASE)
     filtered = {k: v for k, v in flat.items() if lora_pattern.match(k)}
     
