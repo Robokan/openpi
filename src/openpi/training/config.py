@@ -1006,36 +1006,34 @@ _CONFIGS = [
         name="pi05_openarm",
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotOpenArmDataConfig(
-            repo_id="openarm-teleop",
+            repo_id="openarm-teleop-16dof",
             base_config=DataConfig(
                 prompt_from_task=True,
-                local_dir="/home/evaughan/datasets/vla_teleop_data_lerobot",
+                local_dir="/home/evaughan/datasets/vla_teleop_data_lerobot_16dof",
             ),
-            assets=AssetsConfig(asset_id="openarm"),
+            assets=AssetsConfig(asset_id="openarm-teleop-16dof"),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
-        batch_size=16,  # Smaller batch for small dataset (7 episodes)
+        batch_size=16,
     ),
     # NGC container version - uses /datasets mount point
-    # Batch size reduced to 2 to avoid OOM on GB10 (unified memory system)
     TrainConfig(
         name="pi05_openarm_ngc",
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotOpenArmDataConfig(
-            repo_id="openarm-teleop",
+            repo_id="openarm-teleop-16dof",
             base_config=DataConfig(
                 prompt_from_task=True,
-                local_dir="/datasets/vla_teleop_data_lerobot",
+                local_dir="/datasets/vla_teleop_data_lerobot_16dof",
             ),
-            assets=AssetsConfig(asset_id="openarm"),
+            assets=AssetsConfig(asset_id="openarm-teleop-16dof"),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
         batch_size=2,
     ),
-    # NGC container version with LoRA - much lower memory usage
-    # Only trains small adapter layers, freezes the rest of the 3B model
+    # NGC container version with LoRA - lower memory usage
     TrainConfig(
         name="pi05_openarm_ngc_lora",
         model=pi0_config.Pi0Config(
@@ -1044,12 +1042,12 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotOpenArmDataConfig(
-            repo_id="openarm-teleop",
+            repo_id="openarm-teleop-16dof",
             base_config=DataConfig(
                 prompt_from_task=True,
-                local_dir="/datasets/vla_teleop_data_lerobot",
+                local_dir="/datasets/vla_teleop_data_lerobot_16dof",
             ),
-            assets=AssetsConfig(asset_id="openarm"),
+            assets=AssetsConfig(asset_id="openarm-teleop-16dof"),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         # Freeze all parameters except LoRA adapters
