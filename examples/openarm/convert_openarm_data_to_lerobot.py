@@ -332,17 +332,13 @@ def convert_raw_teleop(
     print(f"\nDone! Dataset saved to: {LEROBOT_HOME / repo_id}")
 
 
-DATASET_SYMLINKS = {
-    "openarm-teleop-16dof": "/home/evaughan/datasets/vla_teleop_data_lerobot_16dof",
-}
-
-
 def main(
     input: str,
     repo_id: str = "local/openarm-teleop-16dof",
     joint_map: str | None = None,
     raw: bool = False,
     fps: int | None = None,
+    symlink: str | None = None,
 ):
     """Convert OpenArm 22-dim data to 16-dim LeRobot dataset.
     
@@ -352,8 +348,10 @@ def main(
         joint_map: Path to joint_mapping.json from discover_joint_mapping.py
         raw: If True, treat input as raw teleop format (episodes/ with per-column parquet)
         fps: Override FPS (default: from metadata)
+        symlink: Create a symlink at this path pointing to the output dataset.
+            Placed next to the input by default (e.g. input_16dof).
     """
-    input_dir = Path(input)
+    input_dir = Path(input).resolve()
     if not input_dir.exists():
         raise FileNotFoundError(f"Input not found: {input_dir}")
 
@@ -380,14 +378,14 @@ def main(
             convert_raw_teleop(input_dir, repo_id, mapping)
 
     dataset_dir = LEROBOT_HOME / repo_id
-    symlink_target = DATASET_SYMLINKS.get(repo_id)
-    if symlink_target is not None:
-        symlink_path = Path(symlink_target)
-        symlink_path.parent.mkdir(parents=True, exist_ok=True)
-        if symlink_path.is_symlink() or symlink_path.exists():
-            symlink_path.unlink()
-        symlink_path.symlink_to(dataset_dir)
-        print(f"Symlink: {symlink_path} -> {dataset_dir}")
+    if symlink is None:
+        symlink = str(input_dir.parent / f"{input_dir.name}_16dof")
+    symlink_path = Path(symlink)
+    symlink_path.parent.mkdir(parents=True, exist_ok=True)
+    if symlink_path.is_symlink() or symlink_path.exists():
+        symlink_path.unlink()
+    symlink_path.symlink_to(dataset_dir)
+    print(f"Symlink: {symlink_path} -> {dataset_dir}")
 
 
 if __name__ == "__main__":
