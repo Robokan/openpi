@@ -156,32 +156,58 @@ assets/pi05_openarm_ngc_lora/openarm/norm_stats.json
 
 When running in Isaac Lab simulation:
 
-### Current Action Space Mismatch (The Problem)
+### Action Space: VLA (16 DOF) vs Sim (18 DOF)
 
-The **Reach** and **Teleop** environment configs only define 14 DOF in their action space:
-
-```python
-# reach_env_cfg.py / joint_pos_env_cfg.py
-@configclass
-class ActionsCfg:
-    left_arm_action: ActionTerm = MISSING   # 7 joints
-    right_arm_action: ActionTerm = MISSING  # 7 joints
-    # NO GRIPPER ACTIONS DEFINED - Total: 14 DOF
+**VLA outputs 16 DOF**:
+```
+[left_arm(7), left_grip(1), right_arm(7), right_grip(1)]
 ```
 
-But the **VLA outputs 16 DOF** (includes grippers at indices 7 and 15).
+**Sim expects 18 DOF** (due to 2 finger joints per gripper):
+```
+[left_arm(7), left_grip(2), right_arm(7), right_grip(2)]
+```
 
-### Why Teleop Works Differently
+The OpenArm gripper has 2 finger joints that move together (mimic). The environment config uses a wildcard pattern `openarm_left_finger_joint.*` which matches both finger joints:
+
+```python
+# joint_pos_env_cfg.py - TeleopActionsCfg
+self.actions.left_gripper_action = mdp.JointPositionActionCfg(
+    asset_name="robot",
+    joint_names=["openarm_left_finger_joint.*"],  # Matches 2 joints!
+    scale=1.0,
+    use_default_offset=False,
+)
+```
+
+### Client-Side Expansion (16 → 18 DOF)
+
+The `openpi_client_bimanual.py` expands VLA output to match the environment:
+
+```python
+# VLA: [left_arm(7), left_grip(1), right_arm(7), right_grip(1)] = 16 DOF
+# Env: [left_arm(7), left_grip(2), right_arm(7), right_grip(2)] = 18 DOF
+left_arm = vla_actions[0:7]
+left_grip = vla_actions[7]   # Single value
+right_arm = vla_actions[8:15]
+right_grip = vla_actions[15]  # Single value
+
+expanded_actions = np.concatenate([
+    left_arm,
+    [left_grip, left_grip],   # Duplicate for both finger joints
+    right_arm,
+    [right_grip, right_grip], # Duplicate for both finger joints
+])  # Shape: (18,)
+```
+
+### Why Teleop Uses Direct Robot Control
 
 The `teleop_bimanual.py` script **bypasses `env.step()` entirely** and directly controls the robot:
 
 ```python
-# teleop_bimanual.py lines 3663, 3827-3828
-# Grippers - controlled directly via robot API
+# Direct articulation control
 robot.set_joint_position_target(left_targets, joint_ids=left_gripper_ids)
 robot.set_joint_position_target(right_targets, joint_ids=right_gripper_ids)
-
-# Arms - controlled directly via robot API (after IK)
 robot.set_joint_position_target(left_joint_des, joint_ids=left_arm_joint_ids)
 robot.set_joint_position_target(right_joint_des, joint_ids=right_arm_joint_ids)
 ```
@@ -189,67 +215,7 @@ robot.set_joint_position_target(right_joint_des, joint_ids=right_arm_joint_ids)
 This approach was used for:
 1. **IK Control**: Teleop uses inverse kinematics which needs direct articulation access
 2. **Bypassing Command Manager**: `env.step()` triggers command resampling (unwanted during teleop)
-3. **Development Speed**: Faster to iterate without modifying environment configs
-
-### The Correct Fix: Update Environment to 16 DOF
-
-For VLA inference, the environment should be updated to include gripper actions. Modify the Teleop environment config:
-
-**Step 1: Update `ActionsCfg` in `reach_env_cfg.py`:**
-```python
-@configclass
-class ActionsCfg:
-    """Action specifications for the MDP - 16 DOF for VLA compatibility."""
-    
-    left_arm_action: ActionTerm = MISSING      # 7 joints (indices 0-6)
-    left_gripper_action: ActionTerm = MISSING  # 1 joint (index 7)
-    right_arm_action: ActionTerm = MISSING     # 7 joints (indices 8-14)
-    right_gripper_action: ActionTerm = MISSING # 1 joint (index 15)
-```
-
-**Step 2: Configure gripper actions in `joint_pos_env_cfg.py`:**
-```python
-# In OpenArmReachEnvCfg_TELEOP.__post_init__():
-
-# Left gripper - CONTINUOUS position control (not binary)
-self.actions.left_gripper_action = mdp.JointPositionActionCfg(
-    asset_name="robot",
-    joint_names=["openarm_left_finger_joint.*"],
-    scale=1.0,
-    use_default_offset=False,
-)
-
-# Right gripper - CONTINUOUS position control (not binary)
-self.actions.right_gripper_action = mdp.JointPositionActionCfg(
-    asset_name="robot",
-    joint_names=["openarm_right_finger_joint.*"],
-    scale=1.0,
-    use_default_offset=False,
-)
-```
-
-**Important**: Use `JointPositionActionCfg` (continuous), NOT `BinaryJointPositionActionCfg`. The VLA outputs continuous gripper values, not binary open/close.
-
-**Step 3: Verify action order matches VLA output:**
-
-The environment concatenates actions in the order they're defined in `ActionsCfg`. Ensure:
-```
-env.step() expects: [left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)]
-VLA outputs:        [left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)]
-```
-
-### Temporary Workaround (Current State)
-
-Until the environment is updated, the client extracts arm joints only:
-```python
-# VLA: [left_arm(7), left_grip(1), right_arm(7), right_grip(1)]
-# Sim: [left_arm(7), right_arm(7)]
-left_arm = vla_actions[0:7]    # indices 0-6
-right_arm = vla_actions[8:15]  # indices 8-14
-sim_actions = np.concatenate([left_arm, right_arm])  # Shape: (14,)
-```
-
-This means **grippers won't move** - the VLA's gripper commands are discarded.
+3. **Flexibility**: Can target any joint configuration without env config constraints
 
 ### Gripper Value Scaling
 
@@ -339,11 +305,13 @@ This matches how `teleop_bimanual.py` works (see lines 3650-3830).
 
 ## Troubleshooting
 
+### "Invalid action shape, expected: 18, received: 16"
+The environment expects 18 DOF (grippers have 2 finger joints each) but VLA outputs 16 DOF.
+**Fix**: The client expands 16 → 18 DOF by duplicating gripper values. Ensure you're using the updated `openpi_client_bimanual.py`.
+
 ### "Invalid action shape, expected: 14, received: 16"
-The environment's `ActionsCfg` only defines 14 DOF (arms only). Options:
-1. **Quick fix**: Extract arm joints only from VLA output (indices 0-6 and 8-14)
-2. **Proper fix**: Update environment config to include gripper actions (see "The Correct Fix" above)
-3. **Alternative**: Bypass `env.step()` and control robot directly (see "Alternative" above)
+The environment's `ActionsCfg` only defines 14 DOF (arms only, no grippers).
+**Fix**: Use `Isaac-Reach-OpenArm-Bi-Teleop-v0` which includes `TeleopActionsCfg` with gripper actions.
 
 ### "Normalization stats not found"
 Copy `norm_stats.json` to the correct assets directory for your config.
@@ -355,7 +323,10 @@ Ensure images are:
 - Keys: `cam_high`, `cam_left_wrist`, `cam_right_wrist`
 
 ### Grippers not moving
-The current Reach/Teleop environment doesn't include gripper actions. See "Isaac Lab Simulation Specifics" section for how to fix this.
+Check that:
+1. Using `TeleopActionsCfg` environment (includes gripper actions)
+2. Client is expanding 16 → 18 DOF correctly
+3. Gripper values are in sim range [0, 0.044]
 
 ### Lift task has binary grippers
 The Lift task uses `BinaryJointPositionActionCfg` (open/close only). For VLA which outputs continuous values, use `JointPositionActionCfg` instead.
