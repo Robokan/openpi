@@ -37,9 +37,9 @@ services:
       - OPENPI_DATA_HOME=/openpi_assets
       - HF_HOME=/root/.cache/huggingface
       - IS_DOCKER=true
-      # JAX memory settings - lower fraction to leave headroom for checkpoint saves
-      # On unified memory (DGX Spark), we need ~20-30GB free for serialization
-      - XLA_PYTHON_CLIENT_MEM_FRACTION=0.7
+      # JAX memory settings - with LoRA-only saves, we can use more memory
+      # On unified memory (DGX Spark), LoRA checkpoints are ~100MB vs ~12GB full
+      - XLA_PYTHON_CLIENT_MEM_FRACTION=0.8
       # Preallocate memory to avoid fragmentation issues
       - XLA_PYTHON_CLIENT_PREALLOCATE=true
       # Persistent compilation cache - speeds up subsequent runs

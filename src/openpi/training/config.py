@@ -1045,9 +1045,9 @@ _CONFIGS = [
             repo_id="openarm-teleop-16dof",
             base_config=DataConfig(
                 prompt_from_task=True,
-                local_dir="/datasets/vla_teleop_data_lerobot_16dof",
+                local_dir="/root/.cache/huggingface/lerobot/openarm-teleop-16dof",
             ),
-            assets=AssetsConfig(asset_id="openarm-teleop-16dof"),
+            assets=AssetsConfig(asset_id="openarm"),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         # Freeze all parameters except LoRA adapters
@@ -1060,7 +1060,7 @@ _CONFIGS = [
         ema_decay=None,
         num_train_steps=30_000,
         batch_size=2,  # Minimal batch size to maximize headroom for checkpoint saves
-        save_interval=1000,  # Standard interval - save every 1000 steps
+        save_interval=10,  # Testing: save every 10 steps to verify LoRA-only saves work
     ),
     #
     # Debugging configs.

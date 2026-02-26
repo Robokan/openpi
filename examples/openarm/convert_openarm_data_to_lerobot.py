@@ -93,10 +93,13 @@ class JointMapping:
             right_grip_id=m.get("right_grip_index", DEFAULT_RIGHT_GRIP_ID),
         )
 
-    def extract_16(self, data_22: np.ndarray) -> np.ndarray:
-        """Extract 16-dim from 22-dim array. Works on 1D or 2D (batch) arrays."""
+    def extract_16(self, data: np.ndarray) -> np.ndarray:
+        """Extract 16-dim from 22-dim array, or pass through if already 16-dim."""
+        last_dim = data.shape[-1] if data.ndim > 0 else 0
+        if last_dim == 16:
+            return data.astype(np.float32)
         indices = self.left_arm_ids + [self.left_grip_id] + self.right_arm_ids + [self.right_grip_id]
-        return data_22[..., indices].astype(np.float32)
+        return data[..., indices].astype(np.float32)
 
 
 @dataclasses.dataclass(frozen=True)

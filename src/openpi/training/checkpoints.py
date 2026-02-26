@@ -20,8 +20,8 @@ import openpi.training.utils as training_utils
 
 
 # Flag to enable LoRA-only checkpoint saving (saves memory on unified memory systems)
-# Disabled for now - standard saving should work with XLA_PYTHON_CLIENT_MEM_FRACTION=0.7
-SAVE_LORA_ONLY = False
+# Enable on DGX Spark to avoid OOM during checkpoint saves
+SAVE_LORA_ONLY = True
 
 
 def initialize_checkpoint_dir(
