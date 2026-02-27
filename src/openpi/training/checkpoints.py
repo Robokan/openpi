@@ -23,6 +23,10 @@ import openpi.training.utils as training_utils
 # Enable on DGX Spark to avoid OOM during checkpoint saves
 SAVE_LORA_ONLY = True
 
+# Reduce Orbax checkpoint manager verbosity
+logging.getLogger("orbax").setLevel(logging.WARNING)
+logging.getLogger("orbax.checkpoint").setLevel(logging.WARNING)
+
 
 def initialize_checkpoint_dir(
     checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool

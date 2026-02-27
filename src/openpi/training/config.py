@@ -1060,7 +1060,7 @@ _CONFIGS = [
         ema_decay=None,
         num_train_steps=30_000,
         batch_size=2,  # Minimal batch size to maximize headroom for checkpoint saves
-        save_interval=10,  # Testing: save every 10 steps to verify LoRA-only saves work
+        save_interval=1000,  # Save every 1000 steps
     ),
     #
     # Debugging configs.
