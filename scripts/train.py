@@ -240,7 +240,31 @@ def main(config: _config.TrainConfig):
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
 
-    train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
+    # Check if resuming from a LoRA-only checkpoint
+    # LoRA-only checkpoints require full model initialization first (base weights loaded),
+    # then LoRA weights are merged on top. This is different from full checkpoints which
+    # restore everything directly.
+    is_lora_only_resume = False
+    if resuming:
+        latest_step = checkpoint_manager.latest_step()
+        if latest_step is not None:
+            is_lora_only_resume = _checkpoints._is_lora_only_checkpoint(
+                epath.Path(checkpoint_manager.directory), latest_step
+            )
+            if is_lora_only_resume:
+                logging.info(f"Detected LoRA-only checkpoint at step {latest_step}")
+                logging.info("Will initialize full model with base weights, then restore LoRA weights")
+
+    # For LoRA-only resume, we need the full model with base weights loaded first
+    # (not just shapes). For full checkpoint resume, shapes are enough since all
+    # params will be restored from checkpoint.
+    if resuming and not is_lora_only_resume:
+        train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=True)
+    else:
+        # Either not resuming, or resuming from LoRA-only checkpoint
+        # In both cases, we need fully initialized model with base weights
+        train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=False)
+    
     jax.block_until_ready(train_state)
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
