@@ -21,7 +21,7 @@ import openpi.training.utils as training_utils
 
 # Flag to enable LoRA-only checkpoint saving (saves memory on unified memory systems)
 # Enable on DGX Spark to avoid OOM during checkpoint saves
-SAVE_LORA_ONLY = True
+SAVE_LORA_ONLY = False
 
 # Reduce Orbax checkpoint manager verbosity
 logging.getLogger("orbax").setLevel(logging.WARNING)

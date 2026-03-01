@@ -62,9 +62,23 @@ mkdir -p .jax_cache && chmod 777 .jax_cache
 ```bash
 docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
     python scripts/train.py pi05_openarm_ngc_lora \
-    --exp-name my_experiment \
+    --exp-name spark_lora_v3 \
     --no-wandb-enabled \
     --overwrite
+```
+
+**Flags explained**:
+- `--exp-name spark_lora_v3` - Name of experiment (checkpoint saved to `checkpoints/pi05_openarm_ngc_lora/spark_lora_v3/`)
+- `--no-wandb-enabled` - Disable Weights & Biases logging
+- `--overwrite` - Delete existing checkpoint with same name and train fresh
+
+**To resume from a checkpoint** (instead of overwrite):
+```bash
+docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
+    python scripts/train.py pi05_openarm_ngc_lora \
+    --exp-name spark_lora_v3 \
+    --no-wandb-enabled \
+    --resume
 ```
 
 ### 4. Monitor Training
@@ -122,6 +136,18 @@ The working LoRA configuration uses:
 
 LoRA trains only small adapter layers (~1-2% of parameters) while keeping the rest frozen.
 
+### Available Training Configs
+
+The codebase includes multiple OpenArm configs in `src/openpi/training/config.py`:
+
+| Config Name | Description | Use Case |
+|-------------|-------------|----------|
+| `pi05_openarm` | Full fine-tuning | Multi-GPU systems with >120GB VRAM |
+| `pi05_openarm_ngc` | Full fine-tuning (NGC container) | Multi-GPU systems |
+| `pi05_openarm_ngc_lora` | **LoRA fine-tuning (recommended)** | DGX Spark / single GPU |
+
+For DGX Spark, always use `pi05_openarm_ngc_lora` to avoid OOM errors.
+
 ### LoRA-Only Checkpoint Saving
 
 The codebase is configured to save only LoRA adapter weights during checkpoints:
@@ -175,6 +201,30 @@ The XLA compilation cache (`JAX_COMPILATION_CACHE_DIR`) should speed up subseque
 
 During XLA compilation, memory usage spikes (observed: 114GB), then settles to ~100-105GB during training. This is why we need the 0.7 fraction - to leave room for these spikes.
 
+### Robot Arms Move Erratically at Inference
+
+If the robot arms "go crazy" or move to unexpected positions when running inference:
+
+1. **Check normalization stats dimensions** match your training data:
+   ```bash
+   cat checkpoints/pi05_openarm_ngc_lora/<exp_name>/<step>/assets/openarm/norm_stats.json | \
+     python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Dims: {len(d[\"norm_stats\"][\"state\"][\"mean\"])}')"
+   ```
+   For OpenArm bimanual, this should be **16** (not 22 or 32).
+
+2. **If dimensions are wrong**, recompute norm stats and retrain:
+   ```bash
+   # Recompute stats
+   docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
+       python scripts/compute_norm_stats.py pi05_openarm_ngc_lora
+   
+   # Retrain from scratch
+   docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
+       python scripts/train.py pi05_openarm_ngc_lora --exp-name spark_lora_v3 --no-wandb-enabled --overwrite
+   ```
+
+3. **Ensure client observation format matches training**: The inference client must send observations in the exact same format as teleop_bimanual.py recorded them (same joint order, same camera names).
+
 ### `torch.stack()` Column Errors
 
 The NGC container has a newer `datasets` library that returns `Column` objects. The Dockerfile patches lerobot to handle this. If you see these errors, rebuild the container.
@@ -199,6 +249,8 @@ Your dataset should be in LeRobot format with:
 
 ### Normalization Stats
 
+**CRITICAL**: Normalization stats must match your training data dimensions exactly. Mismatched stats will cause the model to learn incorrect mappings and produce erratic behavior at inference.
+
 Compute norm stats before training:
 ```bash
 docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
@@ -207,18 +259,68 @@ docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
 
 Stats are saved to `assets/<config_name>/<asset_id>/norm_stats.json`.
 
+**Verify your norm stats**:
+```bash
+# Check dimensions match your data (should be 16 for OpenArm bimanual)
+cat assets/pi05_openarm_ngc_lora/openarm/norm_stats.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'State dims: {len(d[\"norm_stats\"][\"state\"][\"mean\"])}, Action dims: {len(d[\"norm_stats\"][\"actions\"][\"mean\"])}')"
+```
+
+If dimensions don't match your data, recompute the stats before training.
+
 ## Serving the Trained Model
 
-After training, serve the policy:
+### Step 1: Start the Policy Server
+
+After training completes, serve the policy from the checkpoint:
 
 ```bash
 docker compose -f scripts/docker/compose_ngc.yml run --rm -p 8000:8000 openpi_server_ngc \
     python scripts/serve_policy.py policy:checkpoint \
-    --policy.config=pi05_openarm_ngc_lora \
-    --policy.dir=checkpoints/pi05_openarm_ngc_lora/<exp_name>/<step>
+    --policy.config pi05_openarm_ngc_lora \
+    --policy.dir checkpoints/pi05_openarm_ngc_lora/spark_lora_v3/29999
 ```
 
-Then connect with the OpenPI client from your robot or simulator.
+**Notes**:
+- Replace `29999` with your actual checkpoint step (use the final step, e.g., 29999 for 30k training)
+- The server listens on port 8000 by default
+- First inference takes ~2-3 minutes for model loading and JIT compilation
+
+### Step 2: Run the Isaac Lab Client
+
+In a separate terminal, start the Isaac Lab simulation with the OpenPI client:
+
+```bash
+cd ~/sparkpack/openarm_isaac_lab_trainer
+
+# Start the Isaac Lab container
+./scripts_docker/start_container.sh
+
+# Inside the container, run the client
+./scripts_docker/openpi_client.sh --host localhost --port 8000
+```
+
+**Or run directly without entering the container**:
+```bash
+cd ~/sparkpack/openarm_isaac_lab_trainer
+./scripts_docker/start_container.sh ./scripts_docker/openpi_client.sh --host localhost --port 8000
+```
+
+### Client Controls
+
+Once the simulation is running:
+- **P** - Pause/unpause inference
+- **Q** - Quit episode
+- **C** - Spawn random object from pool
+- **B** - Reset all objects to pool
+- **R** - Reset episode
+
+### Changing the Prompt
+
+The default prompt is "put your hands on the table". To use a different prompt:
+
+```bash
+./scripts_docker/openpi_client.sh --host localhost --port 8000 --prompt "pick up the cube"
+```
 
 ## Comparison: DGX Spark vs Multi-GPU Systems
 
