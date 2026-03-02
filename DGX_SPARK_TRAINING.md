@@ -269,50 +269,89 @@ If dimensions don't match your data, recompute the stats before training.
 
 ## Serving the Trained Model
 
-### Step 1: Start the Policy Server
+### Complete Launch Procedure
 
-After training completes, serve the policy from the checkpoint:
+You need **two terminals**: one for the policy server, one for the Isaac Lab client.
+
+---
+
+### Terminal 1: Start the Policy Server
 
 ```bash
+cd ~/sparkpack/openpi
+
+# Start the policy server (replace 29999 with your checkpoint step)
 docker compose -f scripts/docker/compose_ngc.yml run --rm -p 8000:8000 openpi_server_ngc \
     python scripts/serve_policy.py policy:checkpoint \
     --policy.config pi05_openarm_ngc_lora \
     --policy.dir checkpoints/pi05_openarm_ngc_lora/spark_lora_v3/29999
 ```
 
-**Notes**:
-- Replace `29999` with your actual checkpoint step (use the final step, e.g., 29999 for 30k training)
-- The server listens on port 8000 by default
-- First inference takes ~2-3 minutes for model loading and JIT compilation
+**Wait for**: `Server ready on port 8000` (takes ~2-3 minutes for model loading)
 
-### Step 2: Run the Isaac Lab Client
+---
 
-In a separate terminal, start the Isaac Lab simulation with the OpenPI client:
+### Terminal 2: Start the Isaac Lab Client
 
 ```bash
 cd ~/sparkpack/openarm_isaac_lab_trainer
 
-# Start the Isaac Lab container
+# IMPORTANT: If container was started in a different X session, restart it:
+docker stop isaac-lab 2>/dev/null; docker rm isaac-lab 2>/dev/null
+
+# Start fresh container with X11 forwarding
 ./scripts_docker/start_container.sh
 
-# Inside the container, run the client
+# Run the OpenPI client (connects to policy server)
 ./scripts_docker/openpi_client.sh --host localhost --port 8000
 ```
 
-**Or run directly without entering the container**:
-```bash
-cd ~/sparkpack/openarm_isaac_lab_trainer
-./scripts_docker/start_container.sh ./scripts_docker/openpi_client.sh --host localhost --port 8000
-```
+**Note**: The `openpi_client.sh` script runs from the HOST (not inside the container). It uses `docker exec` internally.
+
+---
+
+### Troubleshooting: No Window Appears
+
+If the Isaac Sim GUI doesn't appear:
+
+1. **Restart the container** (X11 state may be stale):
+   ```bash
+   docker stop isaac-lab && docker rm isaac-lab
+   ./scripts_docker/start_container.sh
+   ./scripts_docker/openpi_client.sh --host localhost --port 8000
+   ```
+
+2. **Check DISPLAY variable**:
+   ```bash
+   echo $DISPLAY  # Should show :0 or :1
+   ```
+
+3. **Allow X11 access**:
+   ```bash
+   xhost +local:docker
+   xhost +local:root
+   ```
+
+4. **Run headless** (no GUI, for testing):
+   ```bash
+   ./scripts_docker/openpi_client.sh --host localhost --port 8000 --headless
+   ```
+
+---
 
 ### Client Controls
 
-Once the simulation is running:
-- **P** - Pause/unpause inference
-- **Q** - Quit episode
-- **C** - Spawn random object from pool
-- **B** - Reset all objects to pool
-- **R** - Reset episode
+Once the simulation is running, click the Isaac Sim window to focus it, then use:
+
+| Key | Action |
+|-----|--------|
+| **P** | Pause/unpause inference |
+| **Q** | Quit episode |
+| **C** | Spawn random object from pool |
+| **B** | Reset all objects to pool |
+| **R** | Reset episode |
+
+---
 
 ### Changing the Prompt
 
@@ -320,6 +359,20 @@ The default prompt is "put your hands on the table". To use a different prompt:
 
 ```bash
 ./scripts_docker/openpi_client.sh --host localhost --port 8000 --prompt "pick up the cube"
+```
+
+---
+
+### Quick Reference (Copy-Paste)
+
+**Terminal 1 (Policy Server):**
+```bash
+cd ~/sparkpack/openpi && docker compose -f scripts/docker/compose_ngc.yml run --rm -p 8000:8000 openpi_server_ngc python scripts/serve_policy.py policy:checkpoint --policy.config pi05_openarm_ngc_lora --policy.dir checkpoints/pi05_openarm_ngc_lora/spark_lora_v3/29999
+```
+
+**Terminal 2 (Isaac Lab Client):**
+```bash
+cd ~/sparkpack/openarm_isaac_lab_trainer && docker stop isaac-lab 2>/dev/null; docker rm isaac-lab 2>/dev/null; ./scripts_docker/start_container.sh && ./scripts_docker/openpi_client.sh --host localhost --port 8000
 ```
 
 ## Comparison: DGX Spark vs Multi-GPU Systems
