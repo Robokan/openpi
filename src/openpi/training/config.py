@@ -1062,6 +1062,33 @@ _CONFIGS = [
         batch_size=2,  # Minimal batch size to maximize headroom for checkpoint saves
         save_interval=10_000,  # Save every 10,000 steps
     ),
+    # NGC container version with LoRA - v2 dataset (screwdriver, arm lifts, box transfer)
+    TrainConfig(
+        name="pi05_openarm_ngc_lora_v2",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotOpenArmDataConfig(
+            repo_id="openarm-teleop-16dof-v2",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_dir="/root/.cache/huggingface/lerobot/openarm-teleop-16dof-v2",
+            ),
+            assets=AssetsConfig(asset_id="openarm-teleop-16dof-v2"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=30_000,
+        batch_size=2,
+        save_interval=10_000,
+    ),
     #
     # Debugging configs.
     #
