@@ -1087,7 +1087,7 @@ _CONFIGS = [
         ema_decay=None,
         num_train_steps=30_000,
         batch_size=2,
-        save_interval=10_000,
+        save_interval=1_000,
     ),
     #
     # Debugging configs.

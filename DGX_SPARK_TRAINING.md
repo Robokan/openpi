@@ -277,17 +277,21 @@ You need **two terminals**: one for the policy server, one for the Isaac Lab cli
 
 ### Terminal 1: Start the Policy Server
 
+**Note**: Use port **8001** to avoid conflicts (many services default to 8000).
+
 ```bash
 cd ~/sparkpack/openpi
 
 # Start the policy server (replace 29999 with your checkpoint step)
-docker compose -f scripts/docker/compose_ngc.yml run --rm -p 8000:8000 openpi_server_ngc \
-    python scripts/serve_policy.py policy:checkpoint \
+docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
+    python scripts/serve_policy.py --port 8001 policy:checkpoint \
     --policy.config pi05_openarm_ngc_lora \
     --policy.dir checkpoints/pi05_openarm_ngc_lora/spark_lora_v3/29999
 ```
 
-**Wait for**: `Server ready on port 8000` (takes ~2-3 minutes for model loading)
+**Wait for**: `server listening on 0.0.0.0:8001` (takes ~2-3 minutes for model loading)
+
+**Important**: The `--port` flag must come **before** `policy:checkpoint`.
 
 ---
 
@@ -302,8 +306,8 @@ docker stop isaac-lab 2>/dev/null; docker rm isaac-lab 2>/dev/null
 # Start fresh container with X11 forwarding
 ./scripts_docker/start_container.sh
 
-# Run the OpenPI client (connects to policy server)
-./scripts_docker/openpi_client.sh --host localhost --port 8000
+# Run the OpenPI client (connects to policy server on port 8001)
+./scripts_docker/openpi_client.sh --host localhost --port 8001
 ```
 
 **Note**: The `openpi_client.sh` script runs from the HOST (not inside the container). It uses `docker exec` internally.
@@ -318,7 +322,7 @@ If the Isaac Sim GUI doesn't appear:
    ```bash
    docker stop isaac-lab && docker rm isaac-lab
    ./scripts_docker/start_container.sh
-   ./scripts_docker/openpi_client.sh --host localhost --port 8000
+   ./scripts_docker/openpi_client.sh --host localhost --port 8001
    ```
 
 2. **Check DISPLAY variable**:
@@ -334,7 +338,7 @@ If the Isaac Sim GUI doesn't appear:
 
 4. **Run headless** (no GUI, for testing):
    ```bash
-   ./scripts_docker/openpi_client.sh --host localhost --port 8000 --headless
+   ./scripts_docker/openpi_client.sh --host localhost --port 8001 --headless
    ```
 
 ---
@@ -355,10 +359,10 @@ Once the simulation is running, click the Isaac Sim window to focus it, then use
 
 ### Changing the Prompt
 
-The default prompt is "put your hands on the table". To use a different prompt:
+The default prompt is "lift arms on the table." To use a different prompt:
 
 ```bash
-./scripts_docker/openpi_client.sh --host localhost --port 8000 --prompt "pick up the cube"
+./scripts_docker/openpi_client.sh --host localhost --port 8001 --prompt "pick up the cube"
 ```
 
 ---
@@ -367,12 +371,12 @@ The default prompt is "put your hands on the table". To use a different prompt:
 
 **Terminal 1 (Policy Server):**
 ```bash
-cd ~/sparkpack/openpi && docker compose -f scripts/docker/compose_ngc.yml run --rm -p 8000:8000 openpi_server_ngc python scripts/serve_policy.py policy:checkpoint --policy.config pi05_openarm_ngc_lora --policy.dir checkpoints/pi05_openarm_ngc_lora/spark_lora_v3/29999
+cd ~/sparkpack/openpi && docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc python scripts/serve_policy.py --port 8001 policy:checkpoint --policy.config pi05_openarm_ngc_lora --policy.dir checkpoints/pi05_openarm_ngc_lora/spark_lora_v3/29999
 ```
 
 **Terminal 2 (Isaac Lab Client):**
 ```bash
-cd ~/sparkpack/openarm_isaac_lab_trainer && docker stop isaac-lab 2>/dev/null; docker rm isaac-lab 2>/dev/null; ./scripts_docker/start_container.sh && ./scripts_docker/openpi_client.sh --host localhost --port 8000
+cd ~/sparkpack/openarm_isaac_lab_trainer && docker stop isaac-lab 2>/dev/null; docker rm isaac-lab 2>/dev/null; ./scripts_docker/start_container.sh && ./scripts_docker/openpi_client.sh --host localhost --port 8001
 ```
 
 ## Comparison: DGX Spark vs Multi-GPU Systems
