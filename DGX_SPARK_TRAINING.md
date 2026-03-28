@@ -214,9 +214,8 @@ If the robot arms "go crazy" or move to unexpected positions when running infere
 
 2. **If dimensions are wrong**, recompute norm stats and retrain:
    ```bash
-   # Recompute stats
-   docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
-       python scripts/compute_norm_stats.py pi05_openarm_ngc_lora
+   # Recompute stats (fast method - seconds instead of hours)
+   python3 scripts/compute_norm_stats_fast.py ~/.cache/huggingface/lerobot/local/your-dataset-name
    
    # Retrain from scratch
    docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
@@ -251,13 +250,26 @@ Your dataset should be in LeRobot format with:
 
 **CRITICAL**: Normalization stats must match your training data dimensions exactly. Mismatched stats will cause the model to learn incorrect mappings and produce erratic behavior at inference.
 
-Compute norm stats before training:
+#### Fast Norm Stats (Recommended)
+
+Use the fast script that reads parquet files directly (seconds instead of hours):
+
+```bash
+python3 scripts/compute_norm_stats_fast.py ~/.cache/huggingface/lerobot/local/your-dataset-name
+```
+
+This computes the same statistics as the original but skips unnecessary image loading.
+
+#### Original Method (Slow)
+
+The original script takes ~6 hours because it loads all images even though they're not used for norm computation:
+
 ```bash
 docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
     python scripts/compute_norm_stats.py pi05_openarm_ngc_lora
 ```
 
-Stats are saved to `assets/<config_name>/<asset_id>/norm_stats.json`.
+Stats are saved to the dataset directory as `norm_stats.json`.
 
 **Verify your norm stats**:
 ```bash
@@ -282,12 +294,14 @@ You need **two terminals**: one for the policy server, one for the Isaac Lab cli
 ```bash
 cd ~/sparkpack/openpi
 
-# Start the policy server (replace 29999 with your checkpoint step)
-docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
+# Start the policy server using the latest checkpoint (29999 for 30k step training)
+docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_serve \
     python scripts/serve_policy.py --port 8001 policy:checkpoint \
     --policy.config pi05_openarm_ngc_lora \
     --policy.dir checkpoints/pi05_openarm_ngc_lora/spark_lora_v3/29999
 ```
+
+**Note**: With `num_train_steps=30_000`, the final checkpoint is at step **29999** (0-indexed). Always use the latest checkpoint for best results.
 
 **Wait for**: `server listening on 0.0.0.0:8001` (takes ~2-3 minutes for model loading)
 
@@ -371,7 +385,7 @@ The default prompt is "lift arms on the table." To use a different prompt:
 
 **Terminal 1 (Policy Server):**
 ```bash
-cd ~/sparkpack/openpi && docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc python scripts/serve_policy.py --port 8001 policy:checkpoint --policy.config pi05_openarm_ngc_lora --policy.dir checkpoints/pi05_openarm_ngc_lora/spark_lora_v3/29999
+cd ~/sparkpack/openpi && docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_serve python scripts/serve_policy.py --port 8001 policy:checkpoint --policy.config pi05_openarm_ngc_lora --policy.dir checkpoints/pi05_openarm_ngc_lora/spark_lora_v3/29999
 ```
 
 **Terminal 2 (Isaac Lab Client):**

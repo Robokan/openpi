@@ -12,6 +12,7 @@
 #       python scripts/train.py pi05_openarm --exp-name spark_v1
 
 services:
+  # For training - uses more memory
   openpi_server_ngc:
     image: openpi_server_ngc
     build:
@@ -58,3 +59,36 @@ services:
     
     # Override default command for interactive use
     # command: /bin/bash
+
+  # For inference/serving - uses minimal memory
+  openpi_serve:
+    image: openpi_server_ngc
+    build:
+      context: ../..
+      dockerfile: scripts/docker/serve_policy_ngc.Dockerfile
+    init: true
+    tty: true
+    stdin_open: true
+    network_mode: host
+    
+    volumes:
+      - $PWD:/app
+      - ${OPENPI_DATA_HOME:-~/.cache/openpi}:/openpi_assets
+      - ${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface
+    
+    environment:
+      - OPENPI_DATA_HOME=/openpi_assets
+      - HF_HOME=/root/.cache/huggingface
+      - IS_DOCKER=true
+      # Minimal memory for inference - allocate on demand
+      - XLA_PYTHON_CLIENT_PREALLOCATE=false
+      - JAX_COMPILATION_CACHE_DIR=/app/.jax_cache
+      - NVIDIA_TF32_OVERRIDE=1
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

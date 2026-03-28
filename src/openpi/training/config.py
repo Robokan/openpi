@@ -1089,6 +1089,38 @@ _CONFIGS = [
         batch_size=2,
         save_interval=1_000,
     ),
+    # NGC container version with LoRA - v3 dataset, reusing v2 norm stats
+    TrainConfig(
+        name="pi05_openarm_ngc_lora_v3",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotOpenArmDataConfig(
+            repo_id="local/openarm-teleop-16dof-v3",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_dir="/root/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v3",
+            ),
+            assets=AssetsConfig(
+                # Use fresh norm stats computed from this dataset
+                assets_dir="/root/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v3",
+                asset_id="",
+            ),
+        ),
+        # Start fresh from pi0.5 base model
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=30_000,
+        batch_size=2,
+        save_interval=5_000,
+    ),
     #
     # Debugging configs.
     #
