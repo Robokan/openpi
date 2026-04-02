@@ -156,6 +156,7 @@ def convert_lerobot_dataset(
     repo_id: str,
     mapping: JointMapping,
     fps: int | None = None,
+    max_episodes: int | None = None,
 ) -> None:
     """Convert an existing 22-dim LeRobot dataset to 16-dim."""
     info_path = input_dir / "meta" / "info.json"
@@ -166,6 +167,9 @@ def convert_lerobot_dataset(
     if fps is None:
         fps = detected_fps
     total_episodes = info["total_episodes"]
+    if max_episodes is not None:
+        total_episodes = min(total_episodes, max_episodes)
+        print(f"Limiting to first {max_episodes} episodes")
     state_dim = info["features"]["observation.state"]["shape"][0]
 
     print(f"Input dataset: {input_dir}")
@@ -232,7 +236,15 @@ def convert_lerobot_dataset(
             dataset.add_frame(frame)
 
         dataset.save_episode()
+        
+        # Flush images every 10 episodes to prevent queue overflow
+        if (ep_idx + 1) % 10 == 0:
+            dataset.stop_image_writer()
+            dataset.start_image_writer()
+            tqdm.tqdm.write(f"  Flushed images through episode {ep_idx}")
 
+    # Final flush - stop image writer to ensure all images are written
+    dataset.stop_image_writer()
     print(f"\nDone! Dataset saved to: {LEROBOT_HOME / repo_id}")
     print(f"  Total episodes: {total_episodes}")
     print(f"  State/Action dim: 16")
@@ -242,6 +254,8 @@ def convert_raw_teleop(
     input_dir: Path,
     repo_id: str,
     mapping: JointMapping,
+    max_episodes: int | None = None,
+    include_mirrored: bool = False,
 ) -> None:
     """Convert raw teleop parquet data (episodes/ dir with per-column format)."""
     episodes_dir = input_dir / "episodes"
@@ -262,12 +276,29 @@ def convert_raw_teleop(
         key=lambda x: int(x.name.split("_")[1]),
     )
 
+    mirrored_dir = input_dir / "mirrored"
+    mirrored_dirs: list[Path] = []
+    if include_mirrored and mirrored_dir.exists():
+        mirrored_dirs = sorted(
+            [d for d in mirrored_dir.iterdir() if d.is_dir() and d.name.startswith("episode_")],
+            key=lambda x: int(x.name.split("_")[1]),
+        )
+
+    if max_episodes is not None:
+        ep_dirs = ep_dirs[:max_episodes]
+        mirrored_dirs = mirrored_dirs[:max_episodes]
+        print(f"Limiting to first {max_episodes} episodes (per source)")
+
+    all_dirs = mirrored_dirs + ep_dirs
     print(f"Raw teleop data: {input_dir}")
-    print(f"  Episodes: {len(ep_dirs)}, FPS: {fps}")
+    print(f"  Original episodes: {len(ep_dirs)}")
+    if mirrored_dirs:
+        print(f"  Mirrored episodes: {len(mirrored_dirs)}")
+    print(f"  Total: {len(all_dirs)}, FPS: {fps}")
 
     dataset = create_16dof_dataset(repo_id, fps=fps)
 
-    for ep_dir in tqdm.tqdm(ep_dirs, desc="Converting episodes"):
+    for ep_idx, ep_dir in enumerate(tqdm.tqdm(all_dirs, desc="Converting episodes")):
         parquet_path = ep_dir / "data.parquet"
         if not parquet_path.exists():
             continue
@@ -331,7 +362,15 @@ def convert_raw_teleop(
             dataset.add_frame(frame)
 
         dataset.save_episode()
+        
+        # Flush images every 10 episodes to prevent queue overflow
+        if (ep_idx + 1) % 10 == 0:
+            dataset.stop_image_writer()
+            dataset.start_image_writer()
+            tqdm.tqdm.write(f"  Flushed images through episode {ep_idx}")
 
+    # Final flush - stop image writer to ensure all images are written
+    dataset.stop_image_writer()
     print(f"\nDone! Dataset saved to: {LEROBOT_HOME / repo_id}")
 
 
@@ -342,6 +381,8 @@ def main(
     raw: bool = False,
     fps: int | None = None,
     symlink: str | None = None,
+    max_episodes: int | None = None,
+    include_mirrored: bool = True,
 ):
     """Convert OpenArm 22-dim data to 16-dim LeRobot dataset.
     
@@ -353,6 +394,8 @@ def main(
         fps: Override FPS (default: from metadata)
         symlink: Create a symlink at this path pointing to the output dataset.
             Placed next to the input by default (e.g. input_16dof).
+        max_episodes: Maximum number of episodes to convert (for testing)
+        include_mirrored: Include mirrored/ episodes alongside originals (default: True)
     """
     input_dir = Path(input).resolve()
     if not input_dir.exists():
@@ -372,13 +415,15 @@ def main(
     print()
 
     if raw:
-        convert_raw_teleop(input_dir, repo_id, mapping)
+        convert_raw_teleop(input_dir, repo_id, mapping, max_episodes=max_episodes,
+                           include_mirrored=include_mirrored)
     else:
         is_lerobot = (input_dir / "meta" / "info.json").exists()
         if is_lerobot:
-            convert_lerobot_dataset(input_dir, repo_id, mapping, fps=fps)
+            convert_lerobot_dataset(input_dir, repo_id, mapping, fps=fps, max_episodes=max_episodes)
         else:
-            convert_raw_teleop(input_dir, repo_id, mapping)
+            convert_raw_teleop(input_dir, repo_id, mapping, max_episodes=max_episodes,
+                               include_mirrored=include_mirrored)
 
     dataset_dir = LEROBOT_HOME / repo_id
     if symlink is None:
