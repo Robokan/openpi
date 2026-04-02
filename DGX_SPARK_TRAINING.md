@@ -35,8 +35,32 @@ This means checkpoint saves compete with GPU memory, requiring careful tuning.
 ## Prerequisites
 
 1. **Docker with NVIDIA Container Toolkit** installed
-2. **Dataset in LeRobot format** at `~/datasets/your_dataset_lerobot`
+2. **Dataset in LeRobot format** at `~/.cache/huggingface/lerobot/local/your-dataset-name`
 3. **Computed normalization statistics** for your dataset
+
+## IMPORTANT: Always Run Commands in the Container
+
+**All Python commands must be run inside the Docker container**, not on the host system. The host does not have the required dependencies (lerobot, JAX, etc.).
+
+```bash
+# WRONG - will fail with "ModuleNotFoundError"
+python3 scripts/train.py ...
+
+# CORRECT - runs inside the container
+docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
+    python scripts/train.py ...
+```
+
+For commands that need access to directories outside the standard mounts, add extra volume mounts:
+
+```bash
+# Example: mounting sparkjax_recordings for conversion
+docker compose -f scripts/docker/compose_ngc.yml run --rm \
+    -v ~/sparkjax_recordings:/sparkjax_recordings \
+    openpi_server_ngc \
+    python examples/openarm/convert_openarm_data_to_lerobot.py \
+    --input /sparkjax_recordings --repo-id local/openarm-teleop-16dof-v3 --raw
+```
 
 ## Quick Start
 
@@ -60,22 +84,24 @@ mkdir -p .jax_cache && chmod 777 .jax_cache
 **Important**: Full fine-tuning requires too much memory for DGX Spark. Use LoRA (Low-Rank Adaptation) instead:
 
 ```bash
+# v3 config with 106-episode dataset
 docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
-    python scripts/train.py pi05_openarm_ngc_lora \
+    python scripts/train.py pi05_openarm_ngc_lora_v3 \
     --exp-name spark_lora_v3 \
     --no-wandb-enabled \
     --overwrite
 ```
 
 **Flags explained**:
-- `--exp-name spark_lora_v3` - Name of experiment (checkpoint saved to `checkpoints/pi05_openarm_ngc_lora/spark_lora_v3/`)
+- `pi05_openarm_ngc_lora_v3` - Config name (uses `openarm-teleop-16dof-v3` dataset with 16 DOF)
+- `--exp-name spark_lora_v3` - Name of experiment (checkpoint saved to `checkpoints/pi05_openarm_ngc_lora_v3/spark_lora_v3/`)
 - `--no-wandb-enabled` - Disable Weights & Biases logging
 - `--overwrite` - Delete existing checkpoint with same name and train fresh
 
 **To resume from a checkpoint** (instead of overwrite):
 ```bash
 docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
-    python scripts/train.py pi05_openarm_ngc_lora \
+    python scripts/train.py pi05_openarm_ngc_lora_v3 \
     --exp-name spark_lora_v3 \
     --no-wandb-enabled \
     --resume
@@ -85,7 +111,7 @@ docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
 
 Training saves checkpoints every 1000 steps to:
 ```
-checkpoints/pi05_openarm_ngc_lora/<exp_name>/<step>/
+checkpoints/pi05_openarm_ngc_lora_v3/<exp_name>/<step>/
 ```
 
 Monitor memory during training:
@@ -236,6 +262,39 @@ Blackwell GPUs may have issues with certain bf16 operations in older JAX version
 
 There's a known issue in OpenPI where checkpoint saves can leak memory over time (see [GitHub Issue #721](https://github.com/Physical-Intelligence/openpi/issues/721)). The LoRA-only saving and cache clearing mitigations help reduce this.
 
+## Converting Raw Teleop Data to LeRobot Format
+
+If you have raw SparkJAX recordings (from teleop), convert them to LeRobot format:
+
+```bash
+cd ~/sparkpack/openpi
+
+# Mount the recordings directory and run conversion
+docker compose -f scripts/docker/compose_ngc.yml run --rm \
+    -v ~/sparkjax_recordings:/sparkjax_recordings \
+    openpi_server_ngc \
+    python examples/openarm/convert_openarm_data_to_lerobot.py \
+    --input /sparkjax_recordings \
+    --repo-id local/openarm-teleop-16dof-v3 \
+    --raw
+```
+
+**Important**: The conversion uses async image writers. It will print "Done!" and then spend additional time writing images. Wait for the command to fully complete before the terminal prompt returns.
+
+The dataset will be saved to: `~/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v3/`
+
+### Verify Conversion
+
+After conversion, verify all images were written:
+
+```bash
+# Count images (should be ~3x the number of frames)
+find ~/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v3/images/ -name "*.png" | wc -l
+
+# Check episode count
+ls ~/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v3/images/observation.images.ego/ | wc -l
+```
+
 ## Dataset Format
 
 Your dataset should be in LeRobot format with:
@@ -252,32 +311,39 @@ Your dataset should be in LeRobot format with:
 
 #### Fast Norm Stats (Recommended)
 
-Use the fast script that reads parquet files directly (seconds instead of hours):
+Use the fast script that reads parquet files directly (seconds instead of hours). This runs on the **host** (not in container) since it only uses standard Python libraries:
 
 ```bash
-python3 scripts/compute_norm_stats_fast.py ~/.cache/huggingface/lerobot/local/your-dataset-name
+# For v3 config
+python3 scripts/compute_norm_stats_fast.py \
+    ~/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v3 \
+    --config pi05_openarm_ngc_lora_v3
+
+# For original config
+python3 scripts/compute_norm_stats_fast.py \
+    ~/.cache/huggingface/lerobot/local/openarm-teleop-16dof \
+    --config pi05_openarm_ngc_lora
 ```
 
-This computes the same statistics as the original but skips unnecessary image loading.
+This saves stats to the correct assets directory (e.g., `assets/pi05_openarm_ngc_lora_v3/openarm/norm_stats.json`) and creates a backup copy in the dataset directory.
 
 #### Original Method (Slow)
 
-The original script takes ~6 hours because it loads all images even though they're not used for norm computation:
+The original script takes ~6 hours because it loads all images even though they're not used for norm computation. Use only if the fast method isn't working:
 
 ```bash
 docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
-    python scripts/compute_norm_stats.py pi05_openarm_ngc_lora
+    python scripts/compute_norm_stats.py pi05_openarm_ngc_lora_v3
 ```
-
-Stats are saved to the dataset directory as `norm_stats.json`.
 
 **Verify your norm stats**:
 ```bash
 # Check dimensions match your data (should be 16 for OpenArm bimanual)
-cat assets/pi05_openarm_ngc_lora/openarm/norm_stats.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'State dims: {len(d[\"norm_stats\"][\"state\"][\"mean\"])}, Action dims: {len(d[\"norm_stats\"][\"actions\"][\"mean\"])}')"
+cat assets/pi05_openarm_ngc_lora_v3/openarm/norm_stats.json | python3 -c \
+    "import sys,json; d=json.load(sys.stdin); print(f'State dims: {len(d[\"norm_stats\"][\"state\"][\"mean\"])}, Action dims: {len(d[\"norm_stats\"][\"actions\"][\"mean\"])}')"
 ```
 
-If dimensions don't match your data, recompute the stats before training.
+If dimensions don't match your data (e.g., shows 14 instead of 16), recompute the stats before training.
 
 ## Serving the Trained Model
 

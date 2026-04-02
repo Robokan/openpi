@@ -1104,9 +1104,8 @@ _CONFIGS = [
                 local_dir="/root/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v3",
             ),
             assets=AssetsConfig(
-                # Use fresh norm stats computed from this dataset
-                assets_dir="/root/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v3",
-                asset_id="",
+                assets_dir="./assets/pi05_openarm_ngc_lora_v3",
+                asset_id="openarm",
             ),
         ),
         # Start fresh from pi0.5 base model

@@ -3,6 +3,7 @@ import functools
 import logging
 import os
 import platform
+import time
 from typing import Any
 
 import etils.epath as epath
@@ -224,13 +225,20 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
+    logging.info("=== TIMING: Creating data loader ===")
+    t_start = time.time()
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
         shuffle=True,
     )
+    logging.info(f"=== TIMING: Data loader created in {time.time() - t_start:.2f}s ===")
+    
+    logging.info("=== TIMING: Getting first batch ===")
+    t_start = time.time()
     data_iter = iter(data_loader)
     batch = next(data_iter)
+    logging.info(f"=== TIMING: First batch loaded in {time.time() - t_start:.2f}s ===")
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
@@ -258,6 +266,8 @@ def main(config: _config.TrainConfig):
     # For LoRA-only resume, we need the full model with base weights loaded first
     # (not just shapes). For full checkpoint resume, shapes are enough since all
     # params will be restored from checkpoint.
+    logging.info("=== TIMING: Initializing train state ===")
+    t_start = time.time()
     if resuming and not is_lora_only_resume:
         train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=True)
     else:
@@ -266,6 +276,7 @@ def main(config: _config.TrainConfig):
         train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=False)
     
     jax.block_until_ready(train_state)
+    logging.info(f"=== TIMING: Train state initialized in {time.time() - t_start:.2f}s ===")
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     if resuming:
@@ -287,9 +298,19 @@ def main(config: _config.TrainConfig):
     )
 
     infos = []
+    first_step_timed = False
     for step in pbar:
+        if not first_step_timed:
+            logging.info("=== TIMING: First training step (includes XLA compilation) ===")
+            t_first_step = time.time()
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
+        
+        if not first_step_timed:
+            jax.block_until_ready(train_state)
+            logging.info(f"=== TIMING: First step completed in {time.time() - t_first_step:.2f}s ===")
+            first_step_timed = True
+        
         infos.append(info)
         
         # If PRIME_XLA_CACHE is set, exit after first step to save the compilation cache
@@ -306,7 +327,11 @@ def main(config: _config.TrainConfig):
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
+        t_batch = time.time()
         batch = next(data_iter)
+        batch_time = time.time() - t_batch
+        if batch_time > 1.0:  # Log if batch loading takes more than 1 second
+            logging.warning(f"=== TIMING: Slow batch load at step {step}: {batch_time:.2f}s ===")
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)

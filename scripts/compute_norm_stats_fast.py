@@ -2,12 +2,13 @@
 """Fast norm stats computation - reads parquet files directly, skips images.
 
 This computes norm stats in seconds instead of hours by avoiding image loading.
+Saves directly to the correct OpenPI assets directory for training.
 
 Usage:
-    python scripts/compute_norm_stats_fast.py /path/to/lerobot/dataset
+    python scripts/compute_norm_stats_fast.py /path/to/dataset --config <config_name>
 
 Example:
-    python scripts/compute_norm_stats_fast.py ~/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v3
+    python scripts/compute_norm_stats_fast.py ~/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v3 --config pi05_openarm_ngc_lora_v3
 """
 
 import argparse
@@ -17,6 +18,13 @@ import os
 
 import numpy as np
 import pyarrow.parquet as pq
+
+# Mapping of config names to their asset paths (relative to ./assets/)
+CONFIG_ASSET_PATHS = {
+    "pi05_openarm_ngc_lora": "pi05_openarm_ngc_lora/openarm",
+    "pi05_openarm_ngc_lora_v2": "pi05_openarm_ngc_lora_v2/openarm-teleop-16dof-v2",
+    "pi05_openarm_ngc_lora_v3": "pi05_openarm_ngc_lora_v3/openarm",
+}
 
 
 def compute_stats(data: np.ndarray) -> dict:
@@ -32,7 +40,7 @@ def compute_stats(data: np.ndarray) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="Fast norm stats computation")
     parser.add_argument("dataset_path", help="Path to LeRobot dataset")
-    parser.add_argument("--output", "-o", help="Output path (default: dataset/norm_stats.json)")
+    parser.add_argument("--config", "-c", required=True, help="Config name (e.g., pi05_openarm_ngc_lora_v3)")
     args = parser.parse_args()
 
     dataset_path = os.path.expanduser(args.dataset_path)
@@ -72,14 +80,22 @@ def main():
         }
     }
     
-    # Determine output path
-    if args.output:
-        output_path = args.output
+    # Determine output path based on config
+    if args.config not in CONFIG_ASSET_PATHS:
+        print(f"Unknown config '{args.config}'. Known configs: {list(CONFIG_ASSET_PATHS.keys())}")
+        print(f"Using default path: assets/{args.config}/openarm/")
+        asset_path = f"{args.config}/openarm"
     else:
-        # Get repo_id from path (last component)
-        repo_id = os.path.basename(dataset_path.rstrip('/'))
-        output_dir = f"{dataset_path}"
-        output_path = f"{output_dir}/norm_stats.json"
+        asset_path = CONFIG_ASSET_PATHS[args.config]
+    
+    # Find the openpi root (where assets/ should be)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    openpi_root = os.path.dirname(script_dir)
+    output_dir = f"{openpi_root}/assets/{asset_path}"
+    output_path = f"{output_dir}/norm_stats.json"
+    
+    print(f"Config: {args.config}")
+    print(f"Output: assets/{asset_path}/norm_stats.json")
     
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     
@@ -87,6 +103,13 @@ def main():
         json.dump(norm_stats, f, indent=2)
     
     print(f"\nNorm stats saved to: {output_path}")
+    
+    # Also save a copy to the dataset directory for backup
+    dataset_copy_path = f"{dataset_path}/norm_stats.json"
+    if output_path != dataset_copy_path:
+        with open(dataset_copy_path, 'w') as f:
+            json.dump(norm_stats, f, indent=2)
+        print(f"Backup copy saved to: {dataset_copy_path}")
     
     # Print summary
     state_stats = norm_stats['norm_stats']['state']
