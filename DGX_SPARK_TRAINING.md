@@ -345,6 +345,74 @@ cat assets/pi05_openarm_ngc_lora_v3/openarm/norm_stats.json | python3 -c \
 
 If dimensions don't match your data (e.g., shows 14 instead of 16), recompute the stats before training.
 
+## Alternative: Training Diffusion Policy (Baseline)
+
+Diffusion Policy is a simpler, smaller model (~50M params) that serves as a good baseline to validate your dataset quality before investing time in π₀.₅ training.
+
+### Why Train Diffusion Policy?
+
+| Aspect | Diffusion Policy | π₀.₅ |
+|--------|-----------------|------|
+| Parameters | ~50M | ~3B |
+| Training Time | ~1-2 hours | ~8+ hours |
+| Memory Usage | ~8GB | ~100GB |
+| Language Conditioning | No | Yes |
+| Use Case | Baseline/validation | Production |
+
+If Diffusion Policy learns your task well, it validates that your dataset is good quality. If it fails, there may be issues with data collection that need addressing before training the larger model.
+
+### Build the PyTorch Container
+
+Diffusion Policy requires PyTorch with CUDA (not JAX). Build the dedicated PyTorch container:
+
+```bash
+cd ~/sparkpack/openpi
+docker compose -f scripts/docker/compose_ngc.yml build openpi_pytorch
+```
+
+### Training Command
+
+```bash
+cd ~/sparkpack/openpi
+
+docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_pytorch \
+    python -m lerobot.scripts.train \
+    --output_dir=outputs/train/diffusion_openarm \
+    --policy.type=diffusion \
+    --policy.device=cuda \
+    --dataset.repo_id=local/openarm-teleop-16dof-v3 \
+    --batch_size=32 \
+    --steps=50000 \
+    --save_freq=5000
+```
+
+**Key parameters:**
+- `--policy.type=diffusion` - Uses the Diffusion Policy architecture
+- `--policy.device=cuda` - **Required** to use GPU (defaults to CPU otherwise)
+- `--dataset.repo_id` - Your LeRobot dataset (same one used for π₀.₅)
+- `--steps` - Number of training steps (50k is a good starting point)
+- `--batch_size` - Can use larger batches since model is smaller
+- `--dataset.episodes="[0,1,2,3,4]"` - Optional: train on subset of episodes for quick testing
+
+**Note**: Use `openpi_pytorch` container (not `openpi_server_ngc`) for Diffusion Policy. The NGC JAX container doesn't have PyTorch CUDA support.
+
+**Warning**: Large image datasets (~400k frames) take a long time to load initially. For quick testing, use `--dataset.episodes` to train on a subset.
+
+### Serving Diffusion Policy
+
+After training, serve the checkpoint:
+
+```bash
+docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_pytorch \
+    python -m lerobot.scripts.eval \
+    --policy.path=outputs/train/diffusion_openarm/checkpoints/last/pretrained_model \
+    --env.type=your_env
+```
+
+**Note**: Diffusion Policy inference is handled differently than π₀.₅ - it uses LeRobot's eval script rather than OpenPI's serve_policy.py.
+
+---
+
 ## Serving the Trained Model
 
 ### Complete Launch Procedure

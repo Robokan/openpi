@@ -60,6 +60,39 @@ services:
     # Override default command for interactive use
     # command: /bin/bash
 
+  # For PyTorch-based training (LeRobot Diffusion Policy)
+  openpi_pytorch:
+    image: openpi_pytorch_ngc
+    build:
+      context: ../..
+      dockerfile: scripts/docker/serve_policy_pytorch_ngc.Dockerfile
+    init: true
+    tty: true
+    stdin_open: true
+    network_mode: host
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    
+    volumes:
+      - $PWD:/app
+      - ${OPENPI_DATA_HOME:-~/.cache/openpi}:/openpi_assets
+      - ${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface
+    
+    environment:
+      - OPENPI_DATA_HOME=/openpi_assets
+      - HF_HOME=/root/.cache/huggingface
+      - IS_DOCKER=true
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
   # For inference/serving - uses minimal memory
   openpi_serve:
     image: openpi_server_ngc

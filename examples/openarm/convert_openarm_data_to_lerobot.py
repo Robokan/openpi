@@ -47,6 +47,31 @@ try:
     from lerobot.common.datasets.lerobot_dataset import LEROBOT_HOME
 except ImportError:
     from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME as LEROBOT_HOME
+
+# MONKEY PATCH: Fix memory leak in LeRobot v0.1.0
+# See: https://github.com/huggingface/lerobot/issues/1346
+# The original _save_episode_table accumulates ALL episodes in self.hf_dataset,
+# causing ~1GB memory growth per episode. This patch removes the accumulation.
+import datasets
+from lerobot.common.datasets.utils import embed_images, hf_transform_to_torch
+
+_original_save_episode_table = LeRobotDataset._save_episode_table
+
+def _save_episode_table_no_accumulate(self, episode_buffer: dict, episode_index: int) -> None:
+    """Patched version that doesn't accumulate episodes in memory."""
+    episode_dict = {key: episode_buffer[key] for key in self.hf_features}
+    ep_dataset = datasets.Dataset.from_dict(episode_dict, features=self.hf_features, split="train")
+    ep_dataset = embed_images(ep_dataset)
+    # DON'T accumulate: self.hf_dataset = concatenate_datasets([self.hf_dataset, ep_dataset])
+    self.hf_dataset.set_transform(hf_transform_to_torch)
+    ep_data_path = self.root / self.meta.get_data_file_path(ep_index=episode_index)
+    ep_data_path.parent.mkdir(parents=True, exist_ok=True)
+    ep_dataset.to_parquet(ep_data_path)
+
+LeRobotDataset._save_episode_table = _save_episode_table_no_accumulate
+print("Applied LeRobot memory leak fix (issue #1346)")
+# END MONKEY PATCH
+
 import numpy as np
 import pyarrow.parquet as pq
 import torch
@@ -256,6 +281,7 @@ def convert_raw_teleop(
     mapping: JointMapping,
     max_episodes: int | None = None,
     include_mirrored: bool = False,
+    skip_episodes: int = 0,
 ) -> None:
     """Convert raw teleop parquet data (episodes/ dir with per-column format)."""
     episodes_dir = input_dir / "episodes"
@@ -284,90 +310,107 @@ def convert_raw_teleop(
             key=lambda x: int(x.name.split("_")[1]),
         )
 
-    if max_episodes is not None:
-        ep_dirs = ep_dirs[:max_episodes]
-        mirrored_dirs = mirrored_dirs[:max_episodes]
-        print(f"Limiting to first {max_episodes} episodes (per source)")
-
+    # Combine all directories (mirrored first, then originals)
     all_dirs = mirrored_dirs + ep_dirs
+    
+    # Apply skip_episodes to combined list
+    if skip_episodes > 0:
+        print(f"Skipping first {skip_episodes} episodes")
+        all_dirs = all_dirs[skip_episodes:]
+    
+    # Apply max_episodes to combined list
+    if max_episodes is not None:
+        all_dirs = all_dirs[:max_episodes]
+        print(f"Limiting to {max_episodes} episodes total")
+    
     print(f"Raw teleop data: {input_dir}")
     print(f"  Original episodes: {len(ep_dirs)}")
     if mirrored_dirs:
         print(f"  Mirrored episodes: {len(mirrored_dirs)}")
-    print(f"  Total: {len(all_dirs)}, FPS: {fps}")
+    print(f"  Total to convert: {len(all_dirs)}, FPS: {fps}")
 
     dataset = create_16dof_dataset(repo_id, fps=fps)
 
     for ep_idx, ep_dir in enumerate(tqdm.tqdm(all_dirs, desc="Converting episodes")):
-        parquet_path = ep_dir / "data.parquet"
-        if not parquet_path.exists():
-            continue
+        try:
+            parquet_path = ep_dir / "data.parquet"
+            if not parquet_path.exists():
+                print(f"  Skipping {ep_dir.name}: no data.parquet")
+                continue
 
-        import pandas as pd
-        df = pd.read_parquet(parquet_path)
+            import pandas as pd
+            df = pd.read_parquet(parquet_path)
 
-        state_cols = sorted(
-            [c for c in df.columns if c.startswith("observation.state.")],
-            key=lambda x: int(x.split(".")[-1]),
-        )
-        action_cols = sorted(
-            [c for c in df.columns if c.startswith("action.")],
-            key=lambda x: int(x.split(".")[-1]),
-        )
+            state_cols = sorted(
+                [c for c in df.columns if c.startswith("observation.state.")],
+                key=lambda x: int(x.split(".")[-1]),
+            )
+            action_cols = sorted(
+                [c for c in df.columns if c.startswith("action.")],
+                key=lambda x: int(x.split(".")[-1]),
+            )
 
-        states_22 = df[state_cols].values.astype(np.float32)
-        actions_22 = df[action_cols].values.astype(np.float32)
+            states_22 = df[state_cols].values.astype(np.float32)
+            actions_22 = df[action_cols].values.astype(np.float32)
 
-        ep_meta_path = ep_dir / "metadata.json"
-        ep_task = task_text
-        if ep_meta_path.exists():
-            with open(ep_meta_path) as f:
-                ep_meta = json.load(f)
-            ep_task = ep_meta.get("task_text", task_text)
+            ep_meta_path = ep_dir / "metadata.json"
+            ep_task = task_text
+            if ep_meta_path.exists():
+                with open(ep_meta_path) as f:
+                    ep_meta = json.load(f)
+                ep_task = ep_meta.get("task_text", task_text)
 
-        camera_files = {}
-        for cam in CAMERAS:
-            cam_dir = ep_dir / cam
-            if cam_dir.exists():
-                files = sorted(
-                    list(cam_dir.glob("frame_*.png")) + list(cam_dir.glob("frame_*.jpg")),
-                    key=lambda f: f.stem,
-                )
-                camera_files[cam] = files
+            camera_files = {}
+            for cam in CAMERAS:
+                cam_dir = ep_dir / cam
+                if cam_dir.exists():
+                    files = sorted(
+                        list(cam_dir.glob("frame_*.png")) + list(cam_dir.glob("frame_*.jpg")),
+                        key=lambda f: f.stem,
+                    )
+                    camera_files[cam] = files
 
-        num_frames = len(states_22)
-        if camera_files:
-            min_imgs = min(len(f) for f in camera_files.values() if f)
-            num_frames = min(num_frames, min_imgs)
+            num_frames = len(states_22)
+            if camera_files:
+                min_imgs = min(len(f) for f in camera_files.values() if f)
+                num_frames = min(num_frames, min_imgs)
 
-        for i in range(num_frames):
-            state_16 = mapping.extract_16(states_22[i])
-            action_16 = mapping.extract_16(actions_22[i])
+            for i in range(num_frames):
+                state_16 = mapping.extract_16(states_22[i])
+                action_16 = mapping.extract_16(actions_22[i])
 
-            frame = {
-                "observation.state": torch.from_numpy(state_16),
-                "action": torch.from_numpy(action_16),
-                "task": ep_task,
-            }
+                frame = {
+                    "observation.state": torch.from_numpy(state_16),
+                    "action": torch.from_numpy(action_16),
+                    "task": ep_task,
+                }
 
-            for cam, files in camera_files.items():
-                if i < len(files):
-                    from PIL import Image
-                    img = Image.open(files[i])
-                    img_array = np.array(img)
-                    if img_array.ndim == 3 and img_array.shape[2] == 4:
-                        img_array = img_array[:, :, :3]
-                    frame[f"observation.images.{cam}"] = img_array
+                for cam, files in camera_files.items():
+                    if i < len(files):
+                        from PIL import Image
+                        img = Image.open(files[i])
+                        img_array = np.array(img)
+                        if img_array.ndim == 3 and img_array.shape[2] == 4:
+                            img_array = img_array[:, :, :3]
+                        frame[f"observation.images.{cam}"] = img_array
 
-            dataset.add_frame(frame)
+                dataset.add_frame(frame)
 
-        dataset.save_episode()
-        
-        # Flush images every 10 episodes to prevent queue overflow
-        if (ep_idx + 1) % 10 == 0:
+            dataset.save_episode()
+            
+            # Flush images every episode to prevent memory accumulation
+            # LeRobot's hf_dataset grows ~1GB per episode, causing OOM after ~90 episodes
             dataset.stop_image_writer()
             dataset.start_image_writer()
-            tqdm.tqdm.write(f"  Flushed images through episode {ep_idx}")
+            if (ep_idx + 1) % 20 == 0:
+                tqdm.tqdm.write(f"  Flushed images through episode {ep_idx}")
+
+        except Exception as e:
+            print(f"\n  ERROR processing {ep_dir.name}: {e}")
+            import traceback
+            traceback.print_exc()
+            print(f"  Skipping this episode and continuing...")
+            continue
 
     # Final flush - stop image writer to ensure all images are written
     dataset.stop_image_writer()
@@ -383,6 +426,7 @@ def main(
     symlink: str | None = None,
     max_episodes: int | None = None,
     include_mirrored: bool = True,
+    skip_episodes: int = 0,
 ):
     """Convert OpenArm 22-dim data to 16-dim LeRobot dataset.
     
@@ -396,6 +440,7 @@ def main(
             Placed next to the input by default (e.g. input_16dof).
         max_episodes: Maximum number of episodes to convert (for testing)
         include_mirrored: Include mirrored/ episodes alongside originals (default: True)
+        skip_episodes: Number of episodes to skip from the start (for batch processing)
     """
     input_dir = Path(input).resolve()
     if not input_dir.exists():
@@ -416,14 +461,14 @@ def main(
 
     if raw:
         convert_raw_teleop(input_dir, repo_id, mapping, max_episodes=max_episodes,
-                           include_mirrored=include_mirrored)
+                           include_mirrored=include_mirrored, skip_episodes=skip_episodes)
     else:
         is_lerobot = (input_dir / "meta" / "info.json").exists()
         if is_lerobot:
             convert_lerobot_dataset(input_dir, repo_id, mapping, fps=fps, max_episodes=max_episodes)
         else:
             convert_raw_teleop(input_dir, repo_id, mapping, max_episodes=max_episodes,
-                               include_mirrored=include_mirrored)
+                               include_mirrored=include_mirrored, skip_episodes=skip_episodes)
 
     dataset_dir = LEROBOT_HOME / repo_id
     if symlink is None:
