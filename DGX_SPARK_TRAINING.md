@@ -262,37 +262,114 @@ Blackwell GPUs may have issues with certain bf16 operations in older JAX version
 
 There's a known issue in OpenPI where checkpoint saves can leak memory over time (see [GitHub Issue #721](https://github.com/Physical-Intelligence/openpi/issues/721)). The LoRA-only saving and cache clearing mitigations help reduce this.
 
-## Converting Raw Teleop Data to LeRobot Format
+## Data Collection Workflows
 
-If you have raw SparkJAX recordings (from teleop), convert them to LeRobot format:
+SparkJAX supports two data collection modes. Choose based on your workflow:
+
+### Option A: LeRobot Direct Recording (Recommended)
+
+SparkJAX can record directly to LeRobot format with video encoding. Each episode gets its own dataset:
+
+```
+~/sparkjax_recordings/lerobot/local/episodes/
+├── ep0000/    # Episode 0
+├── ep0001/    # Episode 1
+└── ep0042/    # Episode 42 (bad? just delete it!)
+```
+
+**Advantages:**
+- No conversion step needed
+- Easy to delete bad episodes before training
+- Video encoding happens during recording
+- Source videos stored at 640×480 (future-proofed)
+
+**Recording:** See SparkJAX documentation for teleoperation commands.
+
+**Merge for training:**
 
 ```bash
 cd ~/sparkpack/openpi
 
-# Mount the recordings directory and run conversion
-docker compose -f scripts/docker/compose_ngc.yml run --rm \
-    -v ~/sparkjax_recordings:/sparkjax_recordings \
-    openpi_server_ngc \
-    python examples/openarm/convert_openarm_data_to_lerobot.py \
-    --input /sparkjax_recordings \
-    --repo-id local/openarm-teleop-16dof-v3 \
+# Preview what will be merged (dry run)
+python scripts/merge_lerobot_episodes.py --dry-run
+
+# Merge all episodes (auto-converts 640×480 → 224×224)
+python scripts/merge_lerobot_episodes.py
+
+# Keep original resolution (no re-encoding)
+python scripts/merge_lerobot_episodes.py --target-resolution 0
+```
+
+The merge script:
+- **Detects source resolution** and re-encodes to 224×224 if needed
+- **Uses SVT-AV1** (matching LeRobot's default codec)
+- **Updates metadata** to reflect the new resolution
+- Outputs to `~/sparkjax_recordings/lerobot/local/openarm-training/`
+
+**Train with merged dataset:**
+```bash
+--dataset.repo_id=local/openarm-training
+```
+
+### Option B: Converting Raw JPEG Recordings (Legacy)
+
+If you have raw SparkJAX recordings in JPEG format (older workflow), convert them to LeRobot format:
+
+```bash
+cd ~/sparkpack/openpi
+
+uv run examples/openarm/convert_openarm_data_to_lerobot.py \
+    --input ~/sparkjax_recordings \
+    --repo-id local/openarm-teleop-16dof-v4 \
     --raw
 ```
 
-**Important**: The conversion uses async image writers. It will print "Done!" and then spend additional time writing images. Wait for the command to fully complete before the terminal prompt returns.
+By default, the converter:
+- **Resizes images to 224×224** (from 480×640) — matches both Diffusion Policy and π₀.₅ input sizes
+- **Encodes as AV1 video** (not PNG images) — reduces dataset from ~358GB to ~2-3GB
+- **Includes mirrored episodes** from `~/sparkjax_recordings/mirrored/` if present
 
-The dataset will be saved to: `~/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v3/`
+Optional flags:
+- `--no-video` — Store as images instead of video (much larger)
+- `--image-size 96` — Use smaller images (e.g., for Diffusion Policy only)
+- `--no-include-mirrored` — Skip mirrored episodes
+- `--max-episodes 5` — Convert only a few episodes for quick testing
+
+The dataset will be saved to: `~/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v4/`
+
+### Viewing Episodes
+
+Use `scripts/view_episode.py` to generate a combined 3-camera video (left wrist | ego | right wrist):
+
+```bash
+cd ~/sparkpack/openpi && docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_pytorch \
+    python scripts/view_episode.py 5
+```
+
+Videos save to `~/sparkpack/openpi/outputs/viz/`:
+
+```bash
+vlc ~/sparkpack/openpi/outputs/viz/episode_5.mp4
+```
+
+Replace `5` with any episode index.
+
+To view a single camera's raw AV1 video directly (requires software decoding on ARM):
+
+```bash
+vlc --avcodec-hw=none ~/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v4/videos/chunk-000/observation.images.ego/episode_000000.mp4
+```
 
 ### Verify Conversion
 
-After conversion, verify all images were written:
+After conversion, verify videos were written:
 
 ```bash
-# Count images (should be ~3x the number of frames)
-find ~/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v3/images/ -name "*.png" | wc -l
+# Check video count per camera (should match episode count)
+ls ~/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v4/videos/chunk-000/observation.images.ego/ | wc -l
 
-# Check episode count
-ls ~/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v3/images/observation.images.ego/ | wc -l
+# Check total dataset size (should be ~2-3GB, not hundreds of GB)
+du -sh ~/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v4/
 ```
 
 ## Dataset Format
@@ -380,8 +457,9 @@ docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_pytorch \
     --output_dir=outputs/train/diffusion_openarm \
     --policy.type=diffusion \
     --policy.device=cuda \
-    --dataset.repo_id=local/openarm-teleop-16dof-v3 \
+    --dataset.repo_id=local/openarm-teleop-16dof-v4 \
     --batch_size=32 \
+    --num_workers=2 \
     --steps=50000 \
     --save_freq=5000
 ```
@@ -392,11 +470,12 @@ docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_pytorch \
 - `--dataset.repo_id` - Your LeRobot dataset (same one used for π₀.₅)
 - `--steps` - Number of training steps (50k is a good starting point)
 - `--batch_size` - Can use larger batches since model is smaller
+- `--num_workers=2` - Data loading parallelism (0 is safest but slowest)
 - `--dataset.episodes="[0,1,2,3,4]"` - Optional: train on subset of episodes for quick testing
 
 **Note**: Use `openpi_pytorch` container (not `openpi_server_ngc`) for Diffusion Policy. The NGC JAX container doesn't have PyTorch CUDA support.
 
-**Warning**: Large image datasets (~400k frames) take a long time to load initially. For quick testing, use `--dataset.episodes` to train on a subset.
+**Note**: Use the v4 dataset (video mode, 224×224). The v3 dataset (PNG images, 480×640) is 358GB and causes OOM / multi-hour loading times on DGX Spark.
 
 ### Serving Diffusion Policy
 

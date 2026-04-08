@@ -127,9 +127,11 @@ class JointMapping:
         return data[..., indices].astype(np.float32)
 
 
+IMG_SIZE = 224
+
 @dataclasses.dataclass(frozen=True)
 class DatasetConfig:
-    use_videos: bool = False
+    use_videos: bool = True
     tolerance_s: float = 0.0001
     image_writer_processes: int = 8
     image_writer_threads: int = 4
@@ -138,7 +140,7 @@ class DatasetConfig:
 def create_16dof_dataset(
     repo_id: str,
     fps: int = 60,
-    mode: Literal["video", "image"] = "image",
+    mode: Literal["video", "image"] = "video",
     dataset_config: DatasetConfig = DatasetConfig(),
 ) -> LeRobotDataset:
     features = {
@@ -157,7 +159,7 @@ def create_16dof_dataset(
     for cam in CAMERAS:
         features[f"observation.images.{cam}"] = {
             "dtype": mode,
-            "shape": (480, 640, 3),
+            "shape": (IMG_SIZE, IMG_SIZE, 3),
             "names": ["height", "width", "channel"],
         }
 
@@ -182,6 +184,8 @@ def convert_lerobot_dataset(
     mapping: JointMapping,
     fps: int | None = None,
     max_episodes: int | None = None,
+    mode: Literal["video", "image"] = "video",
+    ds_config: DatasetConfig = DatasetConfig(),
 ) -> None:
     """Convert an existing 22-dim LeRobot dataset to 16-dim."""
     info_path = input_dir / "meta" / "info.json"
@@ -218,7 +222,7 @@ def convert_lerobot_dataset(
             for line in f:
                 episodes_meta.append(json.loads(line))
 
-    dataset = create_16dof_dataset(repo_id, fps=fps)
+    dataset = create_16dof_dataset(repo_id, fps=fps, mode=mode, dataset_config=ds_config)
 
     data_pattern = info.get("data_path", "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet")
 
@@ -256,6 +260,7 @@ def convert_lerobot_dataset(
                     img_bytes = img_struct["bytes"]
                     from PIL import Image
                     img = Image.open(io.BytesIO(img_bytes))
+                    img = img.resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)
                     frame[col_name] = np.array(img)
 
             dataset.add_frame(frame)
@@ -282,6 +287,8 @@ def convert_raw_teleop(
     max_episodes: int | None = None,
     include_mirrored: bool = False,
     skip_episodes: int = 0,
+    mode: Literal["video", "image"] = "video",
+    ds_config: DatasetConfig = DatasetConfig(),
 ) -> None:
     """Convert raw teleop parquet data (episodes/ dir with per-column format)."""
     episodes_dir = input_dir / "episodes"
@@ -329,7 +336,7 @@ def convert_raw_teleop(
         print(f"  Mirrored episodes: {len(mirrored_dirs)}")
     print(f"  Total to convert: {len(all_dirs)}, FPS: {fps}")
 
-    dataset = create_16dof_dataset(repo_id, fps=fps)
+    dataset = create_16dof_dataset(repo_id, fps=fps, mode=mode, dataset_config=ds_config)
 
     for ep_idx, ep_dir in enumerate(tqdm.tqdm(all_dirs, desc="Converting episodes")):
         try:
@@ -389,6 +396,7 @@ def convert_raw_teleop(
                     if i < len(files):
                         from PIL import Image
                         img = Image.open(files[i])
+                        img = img.resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)
                         img_array = np.array(img)
                         if img_array.ndim == 3 and img_array.shape[2] == 4:
                             img_array = img_array[:, :, :3]
@@ -427,6 +435,8 @@ def main(
     max_episodes: int | None = None,
     include_mirrored: bool = True,
     skip_episodes: int = 0,
+    image_size: int = 224,
+    video: bool = True,
 ):
     """Convert OpenArm 22-dim data to 16-dim LeRobot dataset.
     
@@ -441,7 +451,14 @@ def main(
         max_episodes: Maximum number of episodes to convert (for testing)
         include_mirrored: Include mirrored/ episodes alongside originals (default: True)
         skip_episodes: Number of episodes to skip from the start (for batch processing)
+        image_size: Resize images to this square size (default: 224)
+        video: Use video encoding instead of images (default: True, much smaller dataset)
     """
+    global IMG_SIZE
+    IMG_SIZE = image_size
+    mode: Literal["video", "image"] = "video" if video else "image"
+    ds_config = DatasetConfig(use_videos=video)
+    print(f"Image size: {IMG_SIZE}x{IMG_SIZE}, mode: {mode}")
     input_dir = Path(input).resolve()
     if not input_dir.exists():
         raise FileNotFoundError(f"Input not found: {input_dir}")
@@ -461,14 +478,17 @@ def main(
 
     if raw:
         convert_raw_teleop(input_dir, repo_id, mapping, max_episodes=max_episodes,
-                           include_mirrored=include_mirrored, skip_episodes=skip_episodes)
+                           include_mirrored=include_mirrored, skip_episodes=skip_episodes,
+                           mode=mode, ds_config=ds_config)
     else:
         is_lerobot = (input_dir / "meta" / "info.json").exists()
         if is_lerobot:
-            convert_lerobot_dataset(input_dir, repo_id, mapping, fps=fps, max_episodes=max_episodes)
+            convert_lerobot_dataset(input_dir, repo_id, mapping, fps=fps,
+                                    max_episodes=max_episodes, mode=mode, ds_config=ds_config)
         else:
             convert_raw_teleop(input_dir, repo_id, mapping, max_episodes=max_episodes,
-                               include_mirrored=include_mirrored, skip_episodes=skip_episodes)
+                               include_mirrored=include_mirrored, skip_episodes=skip_episodes,
+                               mode=mode, ds_config=ds_config)
 
     dataset_dir = LEROBOT_HOME / repo_id
     if symlink is None:

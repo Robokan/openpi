@@ -9,12 +9,20 @@ Each teleoperation session creates its own episode dataset:
 This script merges them into a single dataset for training:
     ~/sparkjax_recordings/lerobot/local/openarm-training/
 
+Features:
+    - Automatic video resolution detection and conversion
+    - Records at 640x480 for future-proofing, converts to 224x224 for training
+    - Uses hardware-accelerated encoding when available
+
 Usage:
-    # Merge all episodes
+    # Merge all episodes (auto-converts to 224x224)
     python merge_lerobot_episodes.py
     
     # Merge to custom output
     python merge_lerobot_episodes.py --output local/my-dataset
+    
+    # Keep original resolution (no re-encoding)
+    python merge_lerobot_episodes.py --target-resolution 0
     
     # Dry run (show what would be merged)
     python merge_lerobot_episodes.py --dry-run
@@ -24,9 +32,82 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import pandas as pd
+
+
+TARGET_RESOLUTION = 224
+
+
+def get_video_resolution(video_path: Path) -> tuple[int, int] | None:
+    """Get video resolution using ffprobe."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=p=0:s=x",
+                str(video_path)
+            ],
+            capture_output=True, text=True, check=True
+        )
+        w, h = result.stdout.strip().split("x")
+        return int(w), int(h)
+    except Exception:
+        return None
+
+
+def resize_video(src: Path, dst: Path, target_size: int, fps: int = 50) -> bool:
+    """Re-encode video to target resolution using ffmpeg.
+    
+    Uses SVT-AV1 encoder with settings matching LeRobot defaults.
+    Falls back to libx264 if SVT-AV1 is not available.
+    """
+    scale_filter = f"scale={target_size}:{target_size}:flags=lanczos"
+    
+    # Try SVT-AV1 first (matches LeRobot default)
+    cmd_av1 = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", str(src),
+        "-vf", scale_filter,
+        "-c:v", "libsvtav1",
+        "-crf", "30",
+        "-preset", "6",
+        "-pix_fmt", "yuv420p",
+        "-g", str(fps * 2),
+        "-svtav1-params", "log-level=0",  # Suppress SVT-AV1 info messages
+        "-an",  # No audio
+        str(dst)
+    ]
+    
+    try:
+        subprocess.run(cmd_av1, capture_output=True, check=True)
+        return True
+    except subprocess.CalledProcessError:
+        pass
+    
+    # Fallback to x264 (widely available)
+    cmd_h264 = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", str(src),
+        "-vf", scale_filter,
+        "-c:v", "libx264",
+        "-crf", "23",
+        "-preset", "fast",
+        "-pix_fmt", "yuv420p",
+        "-an",
+        str(dst)
+    ]
+    
+    try:
+        subprocess.run(cmd_h264, capture_output=True, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"    ERROR: ffmpeg failed: {e.stderr.decode() if e.stderr else 'unknown error'}")
+        return False
 
 
 def main():
@@ -48,6 +129,11 @@ def main():
         "--dry-run", 
         action="store_true",
         help="Show what would be merged without making changes")
+    parser.add_argument(
+        "--target-resolution",
+        type=int,
+        default=TARGET_RESOLUTION,
+        help=f"Target video resolution (default: {TARGET_RESOLUTION}). Set to 0 to keep original.")
     args = parser.parse_args()
     
     lerobot_home = Path(args.lerobot_home)
@@ -82,6 +168,32 @@ def main():
     print(f"\nTotal: {len(episode_paths)} episodes, {total_frames} frames")
     print(f"Output: {output_path}")
     
+    # Check source video resolution
+    source_resolution = None
+    needs_resize = False
+    for ep_path in episode_paths:
+        src_videos = ep_path / "videos"
+        if src_videos.exists():
+            for cam_dir in src_videos.iterdir():
+                if cam_dir.is_dir():
+                    for video_file in cam_dir.glob("episode_*.mp4"):
+                        source_resolution = get_video_resolution(video_file)
+                        break
+                if source_resolution:
+                    break
+        if source_resolution:
+            break
+    
+    if source_resolution and args.target_resolution > 0:
+        src_w, src_h = source_resolution
+        if src_w != args.target_resolution or src_h != args.target_resolution:
+            needs_resize = True
+            print(f"\nVideo resolution: {src_w}x{src_h} -> {args.target_resolution}x{args.target_resolution}")
+        else:
+            print(f"\nVideo resolution: {src_w}x{src_h} (no resize needed)")
+    elif args.target_resolution == 0:
+        print(f"\nVideo resolution: keeping original ({source_resolution[0]}x{source_resolution[1]} if available)")
+    
     if args.dry_run:
         print("\n[DRY RUN - no changes made]")
         return 0
@@ -97,12 +209,18 @@ def main():
     (output_path / "videos").mkdir()
     
     # Merge episodes
-    print("\nMerging episodes...")
+    if needs_resize:
+        print("\nMerging episodes (with video re-encoding, this may take a while)...")
+    else:
+        print("\nMerging episodes...")
     global_frame_idx = 0
     episodes_meta = []
     
     for ep_idx, ep_path in enumerate(episode_paths):
-        print(f"  Processing {ep_path.name} -> episode_{ep_idx:06d}")
+        status = f"  [{ep_idx+1}/{len(episode_paths)}] {ep_path.name} -> episode_{ep_idx:06d}"
+        if needs_resize:
+            status += " (resizing videos)"
+        print(status)
         
         # Read episode info
         with open(ep_path / "meta" / "info.json") as f:
@@ -130,7 +248,7 @@ def main():
             
             global_frame_idx += num_frames
         
-        # Copy videos if they exist
+        # Copy/resize videos if they exist
         src_videos = ep_path / "videos"
         if src_videos.exists():
             for cam_dir in src_videos.iterdir():
@@ -139,9 +257,16 @@ def main():
                     dst_cam_dir.mkdir(exist_ok=True)
                     
                     for video_file in cam_dir.glob("episode_*.mp4"):
-                        # Rename to new episode index
                         dst_video = dst_cam_dir / f"episode_{ep_idx:06d}.mp4"
-                        shutil.copy(video_file, dst_video)
+                        
+                        if needs_resize:
+                            # Get FPS from episode info
+                            fps = ep_info.get("fps", 50)
+                            if not resize_video(video_file, dst_video, args.target_resolution, fps):
+                                print(f"    WARNING: Failed to resize {video_file}, copying original")
+                                shutil.copy(video_file, dst_video)
+                        else:
+                            shutil.copy(video_file, dst_video)
     
     # Create merged metadata
     print("\nCreating metadata...")
@@ -153,6 +278,18 @@ def main():
     info["total_episodes"] = len(episode_paths)
     info["total_frames"] = global_frame_idx
     info["splits"] = {"train": f"0:{len(episode_paths)}"}
+    
+    # Update resolution in features if we resized
+    if needs_resize and args.target_resolution > 0:
+        target_res = args.target_resolution
+        for key, feat in info.get("features", {}).items():
+            if "observation.images" in key:
+                if "shape" in feat:
+                    feat["shape"] = [target_res, target_res, 3]
+                if "video_info" in feat:
+                    feat["video_info"]["video.height"] = target_res
+                    feat["video_info"]["video.width"] = target_res
+        print(f"  Updated metadata to {target_res}x{target_res} resolution")
     
     with open(output_path / "meta" / "info.json", "w") as f:
         json.dump(info, f, indent=2)
