@@ -54,13 +54,15 @@ docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
 For commands that need access to directories outside the standard mounts, add extra volume mounts:
 
 ```bash
-# Example: mounting sparkjax_recordings for conversion
+# Example: mounting sparkjax_recordings for legacy JPEG conversion
 docker compose -f scripts/docker/compose_ngc.yml run --rm \
     -v ~/sparkjax_recordings:/sparkjax_recordings \
     openpi_server_ngc \
     python examples/openarm/convert_openarm_data_to_lerobot.py \
-    --input /sparkjax_recordings --repo-id local/openarm-teleop-16dof-v3 --raw
+    --input /sparkjax_recordings --repo-id local/openarm-teleop-16dof --raw
 ```
+
+**Note**: For new data collection, use the LeRobot Direct Recording workflow (see [Data Collection Workflows](#data-collection-workflows)) which doesn't require conversion.
 
 ## Quick Start
 
@@ -84,25 +86,24 @@ mkdir -p .jax_cache && chmod 777 .jax_cache
 **Important**: Full fine-tuning requires too much memory for DGX Spark. Use LoRA (Low-Rank Adaptation) instead:
 
 ```bash
-# v3 config with 106-episode dataset
 docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
-    python scripts/train.py pi05_openarm_ngc_lora_v3 \
-    --exp-name spark_lora_v3 \
+    python scripts/train.py pi05_openarm_ngc_lora \
+    --exp-name spark_lora \
     --no-wandb-enabled \
     --overwrite
 ```
 
 **Flags explained**:
-- `pi05_openarm_ngc_lora_v3` - Config name (uses `openarm-teleop-16dof-v3` dataset with 16 DOF)
-- `--exp-name spark_lora_v3` - Name of experiment (checkpoint saved to `checkpoints/pi05_openarm_ngc_lora_v3/spark_lora_v3/`)
+- `pi05_openarm_ngc_lora` - Config name (uses 16 DOF bimanual dataset)
+- `--exp-name spark_lora` - Name of experiment (checkpoint saved to `checkpoints/pi05_openarm_ngc_lora/spark_lora/`)
 - `--no-wandb-enabled` - Disable Weights & Biases logging
 - `--overwrite` - Delete existing checkpoint with same name and train fresh
 
 **To resume from a checkpoint** (instead of overwrite):
 ```bash
 docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
-    python scripts/train.py pi05_openarm_ngc_lora_v3 \
-    --exp-name spark_lora_v3 \
+    python scripts/train.py pi05_openarm_ngc_lora \
+    --exp-name spark_lora \
     --no-wandb-enabled \
     --resume
 ```
@@ -111,7 +112,7 @@ docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
 
 Training saves checkpoints every 1000 steps to:
 ```
-checkpoints/pi05_openarm_ngc_lora_v3/<exp_name>/<step>/
+checkpoints/pi05_openarm_ngc_lora/<exp_name>/<step>/
 ```
 
 Monitor memory during training:
@@ -342,43 +343,52 @@ The dataset will be saved to: `~/.cache/huggingface/lerobot/local/openarm-teleop
 Use `scripts/view_episode.py` to generate a combined 3-camera video (left wrist | ego | right wrist):
 
 ```bash
-cd ~/sparkpack/openpi && docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_pytorch \
-    python scripts/view_episode.py 5
+cd ~/sparkpack/openpi
+
+# View episode 0 from the merged training dataset
+docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_pytorch \
+    python scripts/view_episode.py 0 --repo-id local/openarm-training
+
+# View episode 5 from a specific dataset
+docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_pytorch \
+    python scripts/view_episode.py 5 --repo-id local/openarm-teleop-16dof
 ```
 
-Videos save to `~/sparkpack/openpi/outputs/viz/`:
+Videos are saved to `outputs/viz/episode_N.mp4` and can be viewed with:
 
 ```bash
-vlc ~/sparkpack/openpi/outputs/viz/episode_5.mp4
+vlc outputs/viz/episode_0.mp4
 ```
-
-Replace `5` with any episode index.
 
 To view a single camera's raw AV1 video directly (requires software decoding on ARM):
 
 ```bash
-vlc --avcodec-hw=none ~/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v4/videos/chunk-000/observation.images.ego/episode_000000.mp4
+vlc --avcodec-hw=none ~/.cache/huggingface/lerobot/local/openarm-training/videos/ego/episode_000000.mp4
 ```
 
-### Verify Conversion
+### Verify Dataset
 
-After conversion, verify videos were written:
+After merging or converting, verify the dataset is complete:
 
 ```bash
 # Check video count per camera (should match episode count)
-ls ~/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v4/videos/chunk-000/observation.images.ego/ | wc -l
+ls ~/sparkjax_recordings/lerobot/local/openarm-training/videos/ego/ | wc -l
 
-# Check total dataset size (should be ~2-3GB, not hundreds of GB)
-du -sh ~/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v4/
+# Check total dataset size (should be ~50-100MB per episode with video)
+du -sh ~/sparkjax_recordings/lerobot/local/openarm-training/
+
+# View dataset info
+cat ~/sparkjax_recordings/lerobot/local/openarm-training/meta/info.json | python3 -c \
+    "import sys,json; d=json.load(sys.stdin); print(f'Episodes: {d[\"total_episodes\"]}, Frames: {d[\"total_frames\"]}')"
 ```
 
 ## Dataset Format
 
 Your dataset should be in LeRobot format with:
 - `observation.state` - Robot joint positions (16 DOF for bimanual: 7+1 per arm)
-- `observation.images.cam_high` - Overhead camera
-- `observation.images.cam_left_wrist` - Left wrist camera  
-- `observation.images.cam_right_wrist` - Right wrist camera
+- `observation.images.ego` - Overhead/ego camera
+- `observation.images.left_wrist` - Left wrist camera  
+- `observation.images.right_wrist` - Right wrist camera
 - `action` - Target joint positions (16 DOF)
 - Task annotations for prompts
 
@@ -391,18 +401,18 @@ Your dataset should be in LeRobot format with:
 Use the fast script that reads parquet files directly (seconds instead of hours). This runs on the **host** (not in container) since it only uses standard Python libraries:
 
 ```bash
-# For v3 config
+# For merged dataset (from LeRobot direct recording workflow)
 python3 scripts/compute_norm_stats_fast.py \
-    ~/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v3 \
-    --config pi05_openarm_ngc_lora_v3
+    ~/sparkjax_recordings/lerobot/local/openarm-training \
+    --config pi05_openarm_ngc_lora
 
-# For original config
+# For HuggingFace cache location (from legacy conversion)
 python3 scripts/compute_norm_stats_fast.py \
     ~/.cache/huggingface/lerobot/local/openarm-teleop-16dof \
     --config pi05_openarm_ngc_lora
 ```
 
-This saves stats to the correct assets directory (e.g., `assets/pi05_openarm_ngc_lora_v3/openarm/norm_stats.json`) and creates a backup copy in the dataset directory.
+This saves stats to the correct assets directory (e.g., `assets/pi05_openarm_ngc_lora/openarm/norm_stats.json`) and creates a backup copy in the dataset directory.
 
 #### Original Method (Slow)
 
@@ -410,13 +420,13 @@ The original script takes ~6 hours because it loads all images even though they'
 
 ```bash
 docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
-    python scripts/compute_norm_stats.py pi05_openarm_ngc_lora_v3
+    python scripts/compute_norm_stats.py pi05_openarm_ngc_lora
 ```
 
 **Verify your norm stats**:
 ```bash
 # Check dimensions match your data (should be 16 for OpenArm bimanual)
-cat assets/pi05_openarm_ngc_lora_v3/openarm/norm_stats.json | python3 -c \
+cat assets/pi05_openarm_ngc_lora/openarm/norm_stats.json | python3 -c \
     "import sys,json; d=json.load(sys.stdin); print(f'State dims: {len(d[\"norm_stats\"][\"state\"][\"mean\"])}, Action dims: {len(d[\"norm_stats\"][\"actions\"][\"mean\"])}')"
 ```
 
@@ -457,7 +467,7 @@ docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_pytorch \
     --output_dir=outputs/train/diffusion_openarm \
     --policy.type=diffusion \
     --policy.device=cuda \
-    --dataset.repo_id=local/openarm-teleop-16dof-v4 \
+    --dataset.repo_id=local/openarm-training \
     --batch_size=32 \
     --num_workers=2 \
     --steps=50000 \
@@ -467,7 +477,7 @@ docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_pytorch \
 **Key parameters:**
 - `--policy.type=diffusion` - Uses the Diffusion Policy architecture
 - `--policy.device=cuda` - **Required** to use GPU (defaults to CPU otherwise)
-- `--dataset.repo_id` - Your LeRobot dataset (same one used for π₀.₅)
+- `--dataset.repo_id` - Your merged LeRobot dataset (from the merge script)
 - `--steps` - Number of training steps (50k is a good starting point)
 - `--batch_size` - Can use larger batches since model is smaller
 - `--num_workers=2` - Data loading parallelism (0 is safest but slowest)
@@ -475,7 +485,7 @@ docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_pytorch \
 
 **Note**: Use `openpi_pytorch` container (not `openpi_server_ngc`) for Diffusion Policy. The NGC JAX container doesn't have PyTorch CUDA support.
 
-**Note**: Use the v4 dataset (video mode, 224×224). The v3 dataset (PNG images, 480×640) is 358GB and causes OOM / multi-hour loading times on DGX Spark.
+**Note**: Always use video-mode datasets (224×224). PNG image datasets can be 100x larger and cause OOM or multi-hour loading times.
 
 ### Serving Diffusion Policy
 
@@ -511,7 +521,7 @@ cd ~/sparkpack/openpi
 docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_serve \
     python scripts/serve_policy.py --port 8001 policy:checkpoint \
     --policy.config pi05_openarm_ngc_lora \
-    --policy.dir checkpoints/pi05_openarm_ngc_lora/spark_lora_v3/29999
+    --policy.dir checkpoints/pi05_openarm_ngc_lora/spark_lora/29999
 ```
 
 **Note**: With `num_train_steps=30_000`, the final checkpoint is at step **29999** (0-indexed). Always use the latest checkpoint for best results.
@@ -598,7 +608,7 @@ The default prompt is "lift arms on the table." To use a different prompt:
 
 **Terminal 1 (Policy Server):**
 ```bash
-cd ~/sparkpack/openpi && docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_serve python scripts/serve_policy.py --port 8001 policy:checkpoint --policy.config pi05_openarm_ngc_lora --policy.dir checkpoints/pi05_openarm_ngc_lora/spark_lora_v3/29999
+cd ~/sparkpack/openpi && docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_serve python scripts/serve_policy.py --port 8001 policy:checkpoint --policy.config pi05_openarm_ngc_lora --policy.dir checkpoints/pi05_openarm_ngc_lora/spark_lora/29999
 ```
 
 **Terminal 2 (Isaac Lab Client):**
