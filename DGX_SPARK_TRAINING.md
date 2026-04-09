@@ -489,16 +489,48 @@ docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_pytorch \
 
 ### Serving Diffusion Policy
 
-After training, serve the checkpoint:
+After training, serve the checkpoint using the same WebSocket protocol as π₀.₅:
 
 ```bash
-docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_pytorch \
-    python -m lerobot.scripts.eval \
-    --policy.path=outputs/train/diffusion_openarm/checkpoints/last/pretrained_model \
-    --env.type=your_env
+cd ~/sparkpack/openpi
+
+# Serve on port 8001 (default)
+docker compose -f scripts/docker/compose_ngc.yml run --rm -p 8001:8001 openpi_pytorch \
+    python scripts/serve_diffusion_policy.py \
+    --checkpoint outputs/train/diffusion_openarm_v4/checkpoints/045000/pretrained_model \
+    --port 8001
+
+# Or use the latest checkpoint
+docker compose -f scripts/docker/compose_ngc.yml run --rm -p 8001:8001 openpi_pytorch \
+    python scripts/serve_diffusion_policy.py \
+    --checkpoint outputs/train/diffusion_openarm_v4/checkpoints/last/pretrained_model \
+    --port 8001
 ```
 
-**Note**: Diffusion Policy inference is handled differently than π₀.₅ - it uses LeRobot's eval script rather than OpenPI's serve_policy.py.
+The Diffusion Policy server implements the same WebSocket interface as π₀.₅, so SparkJAX can connect to it directly.
+
+### Running with SparkJAX
+
+SparkJAX supports both policy types via voice commands:
+
+| Command | Action |
+|---------|--------|
+| "run pi policy" | Start π₀.₅ inference (port 8001) |
+| "run diffusion policy" | Start Diffusion Policy inference (port 8001) |
+| "run diffusion policy on port 8002" | Specify custom port |
+| "stop policy" | Stop either policy type |
+
+**Example workflow:**
+
+1. Start the Diffusion Policy server (Terminal 1):
+   ```bash
+   cd ~/sparkpack/openpi && docker compose -f scripts/docker/compose_ngc.yml run --rm -p 8001:8001 openpi_pytorch \
+       python scripts/serve_diffusion_policy.py --checkpoint outputs/train/diffusion_openarm_v4/checkpoints/last/pretrained_model
+   ```
+
+2. Say "run diffusion policy" to SparkJAX (or start via the orchestrator)
+
+3. The robot will execute actions from the Diffusion Policy
 
 ---
 
