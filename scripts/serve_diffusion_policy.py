@@ -17,12 +17,94 @@ Usage:
 """
 
 import argparse
+import asyncio
+import http
 import logging
+import time
+import traceback
+
+import msgpack
+import msgpack_numpy
 import numpy as np
 import torch
+import websockets.asyncio.server as ws_server
+import websockets.frames
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Register msgpack numpy support
+msgpack_numpy.patch()
+
+
+class WebsocketPolicyServer:
+    """Simple WebSocket server matching OpenPI's protocol."""
+
+    def __init__(self, policy, host: str = "0.0.0.0", port: int = 8001, metadata: dict = None):
+        self._policy = policy
+        self._host = host
+        self._port = port
+        self._metadata = metadata or {}
+
+    def serve_forever(self):
+        asyncio.run(self._run())
+
+    async def _run(self):
+        async with ws_server.serve(
+            self._handler,
+            self._host,
+            self._port,
+            compression=None,
+            max_size=None,
+            process_request=self._health_check,
+        ) as server:
+            logger.info(f"Diffusion Policy server listening on {self._host}:{self._port}")
+            await server.serve_forever()
+
+    async def _handler(self, websocket):
+        logger.info(f"Connection from {websocket.remote_address}")
+        
+        # Send metadata
+        await websocket.send(msgpack.packb(self._metadata))
+        
+        while True:
+            try:
+                start_time = time.monotonic()
+                
+                # Receive observation
+                data = await websocket.recv()
+                obs = msgpack.unpackb(data, raw=False)
+                
+                # Run inference
+                infer_start = time.monotonic()
+                result = self._policy.infer(obs)
+                infer_time = time.monotonic() - infer_start
+                
+                # Add timing info
+                result["server_timing"] = {"infer_ms": infer_time * 1000}
+                
+                # Send response
+                await websocket.send(msgpack.packb(result))
+                
+            except websockets.ConnectionClosed:
+                logger.info(f"Connection from {websocket.remote_address} closed")
+                # Reset policy state for next connection
+                self._policy.reset()
+                break
+            except Exception as e:
+                logger.error(f"Error: {e}")
+                logger.error(traceback.format_exc())
+                await websocket.close(
+                    code=websockets.frames.CloseCode.INTERNAL_ERROR,
+                    reason=str(e)[:120]
+                )
+                break
+
+    @staticmethod
+    def _health_check(connection, request):
+        if request.path == "/healthz":
+            return connection.respond(http.HTTPStatus.OK, "OK\n")
+        return None
 
 
 class DiffusionPolicyWrapper:
@@ -155,14 +237,10 @@ def main():
         help="Device to run on (default: cuda)")
     args = parser.parse_args()
     
-    # Import OpenPI's WebSocket server
-    from openpi.serving.websocket_policy_server import WebsocketPolicyServer
-    
     # Create wrapped policy
     policy = DiffusionPolicyWrapper(args.checkpoint, device=args.device)
     
     # Serve it
-    logger.info(f"Starting Diffusion Policy server on {args.host}:{args.port}")
     server = WebsocketPolicyServer(
         policy=policy,
         host=args.host,

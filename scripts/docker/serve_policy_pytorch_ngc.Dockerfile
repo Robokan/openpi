@@ -37,7 +37,10 @@ RUN pip install --no-cache-dir --force-reinstall "numpy==1.26.4" && \
     zarr \
     draccus \
     safetensors \
-    accelerate
+    accelerate \
+    msgpack \
+    msgpack-numpy \
+    websockets
 
 # Install same LeRobot commit as JAX container (without deps to preserve PyTorch)
 RUN GIT_LFS_SKIP_SMUDGE=1 pip install --no-cache-dir --no-deps \
