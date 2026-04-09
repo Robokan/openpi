@@ -24,14 +24,37 @@ import time
 import traceback
 
 import msgpack
-import msgpack_numpy
 import numpy as np
 import torch
 import websockets.asyncio.server as ws_server
-
-# Patch msgpack to handle numpy arrays
-msgpack_numpy.patch()
 import websockets.frames
+
+
+def _unpack_array(obj):
+    """Unpack numpy arrays using openpi_client's format."""
+    if b"__ndarray__" in obj:
+        return np.ndarray(buffer=obj[b"data"], dtype=np.dtype(obj[b"dtype"]), shape=obj[b"shape"])
+    if b"__npgeneric__" in obj:
+        return np.dtype(obj[b"dtype"]).type(obj[b"data"])
+    return obj
+
+
+def _pack_array(obj):
+    """Pack numpy arrays using openpi_client's format."""
+    if isinstance(obj, np.ndarray):
+        return {
+            b"__ndarray__": True,
+            b"data": obj.tobytes(),
+            b"dtype": obj.dtype.str,
+            b"shape": obj.shape,
+        }
+    if isinstance(obj, np.generic):
+        return {
+            b"__npgeneric__": True,
+            b"data": obj.item(),
+            b"dtype": obj.dtype.str,
+        }
+    return obj
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -76,7 +99,7 @@ class WebsocketPolicyServer:
                 
                 # Receive observation
                 data = await websocket.recv()
-                obs = msgpack.unpackb(data, raw=False)
+                obs = msgpack.unpackb(data, object_hook=_unpack_array, raw=False)
                 
                 # Run inference
                 infer_start = time.monotonic()
@@ -87,7 +110,7 @@ class WebsocketPolicyServer:
                 result["server_timing"] = {"infer_ms": infer_time * 1000}
                 
                 # Send response
-                await websocket.send(msgpack.packb(result))
+                await websocket.send(msgpack.packb(result, default=_pack_array))
                 
             except websockets.ConnectionClosed:
                 logger.info(f"Connection from {websocket.remote_address} closed")
