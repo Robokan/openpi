@@ -55,6 +55,8 @@ RUN LEROBOT_PATH=$(python -c "import lerobot; import os; print(os.path.dirname(l
     sed -i 's/torch.stack(self.hf_dataset\["episode_index"\])/torch.tensor(list(self.hf_dataset["episode_index"]))/' \
     "$LEROBOT_PATH/common/datasets/lerobot_dataset.py" && \
     sed -i 's/torch.stack(self.hf_dataset.select(q_idx)\[key\])/torch.stack([torch.tensor(x) if not isinstance(x, torch.Tensor) else x for x in list(self.hf_dataset.select(q_idx)[key])])/' \
+    "$LEROBOT_PATH/common/datasets/lerobot_dataset.py" && \
+    sed -i 's/torch.stack(timestamps).tolist()/torch.stack([t if isinstance(t, torch.Tensor) else torch.tensor(t) for t in list(timestamps)]).tolist()/' \
     "$LEROBOT_PATH/common/datasets/lerobot_dataset.py"
 
 # Mount the HuggingFace cache for datasets
