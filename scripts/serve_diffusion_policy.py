@@ -59,9 +59,6 @@ def _pack_array(obj):
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Register msgpack numpy support
-msgpack_numpy.patch()
-
 
 class WebsocketPolicyServer:
     """Simple WebSocket server matching OpenPI's protocol."""
