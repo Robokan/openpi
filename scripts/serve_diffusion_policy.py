@@ -28,6 +28,9 @@ import msgpack_numpy
 import numpy as np
 import torch
 import websockets.asyncio.server as ws_server
+
+# Patch msgpack to handle numpy arrays
+msgpack_numpy.patch()
 import websockets.frames
 
 logging.basicConfig(level=logging.INFO)
