@@ -222,8 +222,9 @@ class DiffusionPolicyWrapper:
         if self._action_chunk is not None and self._chunk_index < len(self._action_chunk):
             action = self._action_chunk[self._chunk_index]
             self._chunk_index += 1
+            logger.info(f"[CACHED] action shape={action.shape}, dtype={action.dtype}")
             return {
-                "actions": action,
+                "actions": action.copy(),  # Ensure writable copy
                 "is_cached": True,
             }
         
@@ -238,16 +239,21 @@ class DiffusionPolicyWrapper:
         if isinstance(actions, torch.Tensor):
             actions = actions.cpu().numpy()
         
+        logger.info(f"[INFER] raw actions shape={actions.shape}, dtype={actions.dtype}")
+        
         # If we got a single action, wrap it
         if actions.ndim == 1:
             actions = actions[np.newaxis, :]
             
         # Store chunk and return first action
-        self._action_chunk = actions
+        self._action_chunk = actions.copy()  # Store writable copy
         self._chunk_index = 1  # Already returning index 0
         
+        action_out = actions[0].copy()  # Ensure writable copy
+        logger.info(f"[INFER] returning action shape={action_out.shape}, first 4: {action_out[:4]}")
+        
         return {
-            "actions": actions[0],
+            "actions": action_out,
             "is_cached": False,
             "chunk_size": len(actions),
         }
