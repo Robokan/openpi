@@ -125,21 +125,60 @@ class DiffusionPolicyWrapper:
     }
     
     def __init__(self, checkpoint_path: str, device: str = "cuda"):
+        import json
+        from pathlib import Path
+        from safetensors.torch import load_file
         from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
+        from lerobot.common.policies.diffusion.configuration_diffusion import DiffusionConfig
+        from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
         
+        checkpoint_path = Path(checkpoint_path)
         logger.info(f"Loading Diffusion Policy from: {checkpoint_path}")
-        self.policy = DiffusionPolicy.from_pretrained(checkpoint_path)
+        
+        # Load config
+        config_path = checkpoint_path / "config.json"
+        with open(config_path) as f:
+            cfg_dict = json.load(f)
+        
+        # Convert features to proper PolicyFeature objects
+        input_features = {}
+        for key, feat in cfg_dict['input_features'].items():
+            ft_type = FeatureType[feat['type']]
+            input_features[key] = PolicyFeature(type=ft_type, shape=feat['shape'])
+        
+        output_features = {}
+        for key, feat in cfg_dict['output_features'].items():
+            ft_type = FeatureType[feat['type']]
+            output_features[key] = PolicyFeature(type=ft_type, shape=feat['shape'])
+        
+        # Convert normalization_mapping to proper NormalizationMode
+        norm_map = {}
+        for key, value in cfg_dict['normalization_mapping'].items():
+            norm_map[FeatureType[key]] = NormalizationMode[value]
+        
+        cfg_dict['input_features'] = input_features
+        cfg_dict['output_features'] = output_features
+        cfg_dict['normalization_mapping'] = norm_map
+        
+        # Create config and model
+        config = DiffusionConfig(**cfg_dict)
+        self.policy = DiffusionPolicy(config)
         self.policy.to(device)
         self.policy.eval()
         self.device = device
         
+        # Load weights
+        weights_path = checkpoint_path / "model.safetensors"
+        weights = load_file(str(weights_path))
+        self.policy.load_state_dict(weights)
+        
         # Action chunking state
         self._action_chunk = None
         self._chunk_index = 0
-        self._n_action_steps = self.policy.config.n_action_steps  # typically 8
+        self._n_action_steps = config.n_action_steps  # typically 8
         
         logger.info(f"Policy loaded: n_action_steps={self._n_action_steps}")
-        logger.info(f"Input features: {list(self.policy.config.input_features.keys())}")
+        logger.info(f"Input features: {list(config.input_features.keys())}")
         
     def reset(self):
         """Reset the action chunk state."""
