@@ -1,0 +1,47 @@
+# Docker Compose for LeRobot Diffusion Policy server on GB10/Blackwell
+#
+# Build:
+#   docker compose -f scripts/docker/compose_diffusion.yml build
+#
+# Run server:
+#   docker compose -f scripts/docker/compose_diffusion.yml run --rm diffusion_server \
+#       python scripts/serve_diffusion_policy.py \
+#       --checkpoint outputs/train/diffusion_openarm_v4/checkpoints/last/pretrained_model \
+#       --port 8001
+
+services:
+  diffusion_server:
+    image: diffusion_policy_server
+    build:
+      context: ../..
+      dockerfile: scripts/docker/diffusion_policy.Dockerfile
+    init: true
+    tty: true
+    stdin_open: true
+    network_mode: host
+    ipc: host
+    
+    # Required for GB10/Blackwell
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    
+    volumes:
+      # Mount project for scripts and checkpoints
+      - $PWD:/app
+      # Mount HuggingFace cache
+      - ${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface
+    
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=0
+    
+    working_dir: /app
