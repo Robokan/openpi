@@ -137,7 +137,7 @@ class DiffusionPolicyWrapper:
     - Camera name remapping (cam_high -> ego, etc.)
     - Image normalization and tensor conversion
     - State normalization using checkpoint's stats
-    - Action chunking (returns actions one at a time from chunks)
+    - Returns full action chunks (SparkJAX's ActionChunkBroker handles iteration)
     """
     
     # Camera name mapping: SparkJAX -> Diffusion Policy
@@ -147,13 +147,14 @@ class DiffusionPolicyWrapper:
         'cam_right_wrist': 'observation.images.right_wrist',
     }
     
-    def __init__(self, checkpoint_path: str, device: str = "cuda"):
+    def __init__(self, checkpoint_path: str, device: str = "cuda", num_inference_steps: int = 10, use_ddim: bool = True):
         import json
         from pathlib import Path
         from safetensors.torch import load_file
         from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
         from lerobot.common.policies.diffusion.configuration_diffusion import DiffusionConfig
         from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+        from diffusers import DDIMScheduler
         
         checkpoint_path = Path(checkpoint_path)
         logger.info(f"Loading Diffusion Policy from: {checkpoint_path}")
@@ -183,6 +184,9 @@ class DiffusionPolicyWrapper:
         cfg_dict['output_features'] = output_features
         cfg_dict['normalization_mapping'] = norm_map
         
+        # Override num_inference_steps for faster inference (default 100 is too slow)
+        cfg_dict['num_inference_steps'] = num_inference_steps
+        
         # Create config and model
         config = DiffusionConfig(**cfg_dict)
         self.policy = DiffusionPolicy(config)
@@ -195,67 +199,89 @@ class DiffusionPolicyWrapper:
         weights = load_file(str(weights_path))
         self.policy.load_state_dict(weights)
         
-        # Action chunking state
-        self._action_chunk = None
-        self._chunk_index = 0
+        # Switch to DDIM scheduler for fast inference (works with 10-20 steps vs 100 for DDPM)
+        if use_ddim:
+            logger.info("Switching to DDIM scheduler for fast inference")
+            ddim_scheduler = DDIMScheduler(
+                num_train_timesteps=self.policy.diffusion.noise_scheduler.config.num_train_timesteps,
+                beta_start=self.policy.diffusion.noise_scheduler.config.beta_start,
+                beta_end=self.policy.diffusion.noise_scheduler.config.beta_end,
+                beta_schedule=self.policy.diffusion.noise_scheduler.config.beta_schedule,
+                clip_sample=self.policy.diffusion.noise_scheduler.config.clip_sample,
+                prediction_type=self.policy.diffusion.noise_scheduler.config.prediction_type,
+            )
+            ddim_scheduler.set_timesteps(num_inference_steps)
+            self.policy.diffusion.noise_scheduler = ddim_scheduler
+        
         self._n_action_steps = config.n_action_steps  # typically 8
         
-        logger.info(f"Policy loaded: n_action_steps={self._n_action_steps}")
+        logger.info(f"Policy loaded: n_action_steps={self._n_action_steps}, num_inference_steps={num_inference_steps}, scheduler={'DDIM' if use_ddim else 'DDPM'}")
         logger.info(f"Input features: {list(config.input_features.keys())}")
         
     def reset(self):
-        """Reset the action chunk state."""
-        self._action_chunk = None
-        self._chunk_index = 0
+        """Reset policy state."""
         self.policy.reset()
         
     def infer(self, obs: dict) -> dict:
         """Run inference matching OpenPI's interface.
         
+        Bypasses LeRobot's internal queue to return full action chunk directly.
+        This is critical for performance - one inference gives n_action_steps actions.
+        
         Args:
             obs: dict with 'state', 'images', 'prompt' from SparkJAX
             
         Returns:
-            dict with 'actions' (single action) and timing info
+            dict with 'actions' as full chunk (n_action_steps, 16)
         """
-        # Check if we have cached actions
-        if self._action_chunk is not None and self._chunk_index < len(self._action_chunk):
-            action = self._action_chunk[self._chunk_index]
-            self._chunk_index += 1
-            logger.info(f"[CACHED] action shape={action.shape}, dtype={action.dtype}")
-            return {
-                "actions": action.copy(),  # Ensure writable copy
-                "is_cached": True,
-            }
+        import time
+        infer_start = time.monotonic()
         
-        # Need to run inference for new chunk
         batch = self._prepare_batch(obs)
         
         with torch.no_grad():
-            # select_action returns [horizon, action_dim] or [action_dim]
-            actions = self.policy.select_action(batch)
-        
-        # Convert to numpy and handle shape
-        if isinstance(actions, torch.Tensor):
-            actions = actions.cpu().numpy()
-        
-        logger.info(f"[INFER] raw actions shape={actions.shape}, dtype={actions.dtype}")
-        
-        # If we got a single action, wrap it
-        if actions.ndim == 1:
-            actions = actions[np.newaxis, :]
+            # Normalize inputs (like select_action does)
+            batch = self.policy.normalize_inputs(batch)
             
-        # Store chunk and return first action
-        self._action_chunk = actions.copy()  # Store writable copy
-        self._chunk_index = 1  # Already returning index 0
+            # Stack images if needed
+            if self.policy.config.image_features:
+                batch = dict(batch)
+                batch["observation.images"] = torch.stack(
+                    [batch[key] for key in self.policy.config.image_features], dim=-4
+                )
+            
+            # Add temporal dimension for observation history
+            # For single observation, repeat n_obs_steps times
+            n_obs = self.policy.config.n_obs_steps
+            batch_with_history = {}
+            for k, v in batch.items():
+                if k in ["observation.state", "observation.images"]:
+                    # Add time dimension: [B, ...] -> [B, T, ...]
+                    batch_with_history[k] = v.unsqueeze(1).repeat(1, n_obs, *([1] * (v.dim() - 1)))
+                else:
+                    batch_with_history[k] = v
+            
+            # Generate full action trajectory
+            actions = self.policy.diffusion.generate_actions(batch_with_history)
+            
+            # Unnormalize actions
+            actions = self.policy.unnormalize_outputs({"action": actions})["action"]
+            
+            # actions shape: [batch=1, horizon, action_dim]
+            # Take n_action_steps starting from n_obs_steps-1 (current timestep)
+            start_idx = n_obs - 1
+            end_idx = start_idx + self._n_action_steps
+            actions = actions[0, start_idx:end_idx]  # [n_action_steps, action_dim]
         
-        action_out = actions[0].copy()  # Ensure writable copy
-        logger.info(f"[INFER] returning action shape={action_out.shape}, first 4: {action_out[:4]}")
+        # Convert to numpy
+        actions = actions.cpu().numpy().copy()
+        
+        infer_time = time.monotonic() - infer_start
+        logger.info(f"[INFER] {infer_time*1000:.0f}ms, chunk shape={actions.shape}, first: {actions[0, :4]}")
         
         return {
-            "actions": action_out,
+            "actions": actions,
             "is_cached": False,
-            "chunk_size": len(actions),
         }
     
     def _prepare_batch(self, obs: dict) -> dict:
@@ -264,6 +290,10 @@ class DiffusionPolicyWrapper:
         
         # State: [16] float32 -> [1, 16] tensor
         state = obs.get("state", np.zeros(16, dtype=np.float32))
+        if isinstance(state, np.ndarray):
+            state = state.copy()  # Ensure writable
+        else:
+            state = np.array(state, dtype=np.float32)
         batch["observation.state"] = torch.from_numpy(state).unsqueeze(0).to(self.device)
         
         # Images: remap and convert
@@ -273,12 +303,16 @@ class DiffusionPolicyWrapper:
                 img = images[spark_name]
                 # SparkJAX sends [3, H, W] uint8
                 if isinstance(img, np.ndarray):
+                    # Debug: log image stats
+                    logger.info(f"[IMG] {spark_name}: shape={img.shape}, dtype={img.dtype}, "
+                               f"min={img.min():.2f}, max={img.max():.2f}, mean={img.mean():.2f}")
                     # Normalize to [0, 1] float and add batch dim
                     img_tensor = torch.from_numpy(img.astype(np.float32) / 255.0)
                     img_tensor = img_tensor.unsqueeze(0).to(self.device)
                     batch[policy_name] = img_tensor
             else:
                 # Create zero image if missing
+                logger.warning(f"[IMG] {spark_name}: MISSING, using zeros")
                 batch[policy_name] = torch.zeros(1, 3, 224, 224, device=self.device)
         
         return batch
@@ -303,10 +337,24 @@ def main():
         "--device",
         default="cuda",
         help="Device to run on (default: cuda)")
+    parser.add_argument(
+        "--num-inference-steps", "-n",
+        type=int,
+        default=10,
+        help="Number of diffusion denoising steps (default: 10, lower=faster but less accurate)")
+    parser.add_argument(
+        "--no-ddim",
+        action="store_true",
+        help="Disable DDIM scheduler (use original DDPM, requires more steps)")
     args = parser.parse_args()
     
     # Create wrapped policy
-    policy = DiffusionPolicyWrapper(args.checkpoint, device=args.device)
+    policy = DiffusionPolicyWrapper(
+        args.checkpoint, 
+        device=args.device,
+        num_inference_steps=args.num_inference_steps,
+        use_ddim=not args.no_ddim
+    )
     
     # Serve it
     server = WebsocketPolicyServer(
