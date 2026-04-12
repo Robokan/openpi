@@ -330,7 +330,7 @@ def main(config: _config.TrainConfig):
         t_batch = time.time()
         batch = next(data_iter)
         batch_time = time.time() - t_batch
-        if batch_time > 1.0:  # Log if batch loading takes more than 1 second
+        if batch_time > 5.0:  # Log if batch loading takes more than 5 seconds
             logging.warning(f"=== TIMING: Slow batch load at step {step}: {batch_time:.2f}s ===")
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
