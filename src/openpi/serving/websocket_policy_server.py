@@ -4,12 +4,46 @@ import logging
 import time
 import traceback
 
+import cv2
+import numpy as np
 from openpi_client import base_policy as _base_policy
 from openpi_client import msgpack_numpy
 import websockets.asyncio.server as _server
 import websockets.frames
 
 logger = logging.getLogger(__name__)
+
+
+def _decode_jpeg_images(obs: dict) -> dict:
+    """Decode JPEG-encoded images in observation dict.
+    
+    Images can be either:
+    - bytes (JPEG encoded) -> decode to [C, H, W] uint8
+    - numpy array [C, H, W] (raw) -> pass through
+    """
+    if "images" not in obs:
+        return obs
+    
+    images = obs["images"]
+    decoded = {}
+    for key, img in images.items():
+        if isinstance(img, (bytes, bytearray)):
+            # JPEG bytes -> decode to numpy
+            arr = np.frombuffer(img, dtype=np.uint8)
+            bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if bgr is not None:
+                # Convert BGR to RGB and transpose to [C, H, W]
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                decoded[key] = np.transpose(rgb, (2, 0, 1))
+            else:
+                logger.warning(f"Failed to decode JPEG for image '{key}'")
+                decoded[key] = np.zeros((3, 224, 224), dtype=np.uint8)
+        else:
+            # Already numpy array, pass through
+            decoded[key] = img
+    
+    obs["images"] = decoded
+    return obs
 
 
 class WebsocketPolicyServer:
@@ -55,11 +89,40 @@ class WebsocketPolicyServer:
         while True:
             try:
                 start_time = time.monotonic()
-                obs = msgpack_numpy.unpackb(await websocket.recv())
+                
+                recv_time = time.monotonic()
+                raw_data = await websocket.recv()
+                recv_time = time.monotonic() - recv_time
+                
+                unpack_time = time.monotonic()
+                obs = msgpack_numpy.unpackb(raw_data)
+                unpack_time = time.monotonic() - unpack_time
+                
+                # Decode JPEG-encoded images if present
+                decode_time = time.monotonic()
+                obs = _decode_jpeg_images(obs)
+                decode_time = time.monotonic() - decode_time
 
                 infer_time = time.monotonic()
                 action = self._policy.infer(obs)
                 infer_time = time.monotonic() - infer_time
+                
+                # Log detailed timing every 50 requests
+                if not hasattr(self, '_req_count'):
+                    self._req_count = 0
+                self._req_count += 1
+                if self._req_count % 50 == 0:
+                    print(f"[SERVER-TIMING] recv={recv_time*1000:.1f}ms unpack={unpack_time*1000:.1f}ms "
+                          f"decode={decode_time*1000:.1f}ms infer={infer_time*1000:.1f}ms "
+                          f"data_size={len(raw_data)/1024:.1f}KB", flush=True)
+
+                # Log gripper values for debugging (indices 7=left, 15=right)
+                if "actions" in action:
+                    actions = action["actions"]
+                    if hasattr(actions, 'shape') and len(actions.shape) >= 1:
+                        first_action = actions[0] if len(actions.shape) > 1 else actions
+                        if len(first_action) >= 16:
+                            logger.info(f"[GRIPPER] left={first_action[7]:.3f}, right={first_action[15]:.3f}")
 
                 action["server_timing"] = {
                     "infer_ms": infer_time * 1000,
