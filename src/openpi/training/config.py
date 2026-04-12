@@ -1120,6 +1120,70 @@ _CONFIGS = [
         batch_size=2,
         save_interval=5_000,
     ),
+    # NGC container version with LoRA - v4 dataset (chocolate bars task)
+    TrainConfig(
+        name="pi05_openarm_ngc_lora_v4",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotOpenArmDataConfig(
+            repo_id="local/openarm-teleop-16dof-v4",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_dir="/root/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v4",
+            ),
+            assets=AssetsConfig(
+                assets_dir="./assets/pi05_openarm_ngc_lora_v4",
+                asset_id="openarm",
+            ),
+        ),
+        # Start fresh from pi0.5 base model
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=30_000,
+        batch_size=2,
+        save_interval=5_000,
+    ),
+    # π₀-FAST with LoRA - v4 dataset (chocolate bars task) - FASTER inference
+    TrainConfig(
+        name="pi0_fast_openarm_ngc_lora_v4",
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=16,  # OpenArm bimanual: 7 joints + 1 gripper per arm
+            action_horizon=16,  # Action chunk size (like DROID bimanual)
+            max_token_len=250,  # Two-arm robot needs more tokens
+            paligemma_variant="gemma_2b_lora",
+        ),
+        data=LeRobotOpenArmDataConfig(
+            repo_id="local/openarm-teleop-16dof-v4",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_dir="/root/.cache/huggingface/lerobot/local/openarm-teleop-16dof-v4",
+            ),
+            assets=AssetsConfig(
+                assets_dir="./assets/pi0_fast_openarm_ngc_lora_v4",
+                asset_id="openarm",
+            ),
+        ),
+        # Start from pi0-FAST base model
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=16,
+            action_horizon=16,
+            max_token_len=250,
+            paligemma_variant="gemma_2b_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=30_000,
+        batch_size=2,
+        save_interval=5_000,
+    ),
     #
     # Debugging configs.
     #
