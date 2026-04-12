@@ -40,7 +40,7 @@ services:
       - IS_DOCKER=true
       # JAX memory settings - leave headroom for checkpoint saves
       # On unified memory (DGX Spark), LoRA checkpoints are ~100MB vs ~12GB full
-      - XLA_PYTHON_CLIENT_MEM_FRACTION=0.7
+      - XLA_PYTHON_CLIENT_MEM_FRACTION=0.6
       # Preallocate memory to avoid fragmentation issues
       - XLA_PYTHON_CLIENT_PREALLOCATE=true
       # Persistent compilation cache - speeds up subsequent runs
