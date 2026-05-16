@@ -38,8 +38,8 @@ class Args:
     # Checkpoint directory containing model.safetensors and assets.
     checkpoint_dir: str = "/checkpoints/pi05_openarm_ngc_lora_v4/chocolate_bars_pi05_pytorch"
 
-    # Path to the TensorRT engine file (.engine).
-    engine_path: str = "/checkpoints/pi05_openarm_ngc_lora_v4/chocolate_bars_pi05_pytorch/onnx/model_fp8.engine"
+    # Path to the TensorRT engine file (.engine). Defaults to the FP8 + NVFP4 engine.
+    engine_path: str = "/checkpoints/pi05_openarm_ngc_lora_v4/chocolate_bars_pi05_pytorch/model_fp4.engine"
 
     # Default prompt to use if not provided in observation.
     default_prompt: str | None = None
