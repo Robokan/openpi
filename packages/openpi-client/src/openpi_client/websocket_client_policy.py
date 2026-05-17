@@ -34,8 +34,21 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
         while True:
             try:
                 headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
+                # Disable websocket keepalive. Inference is a synchronous RPC that can
+                # take 80+ seconds on the first call (PyTorch inductor autotune) and
+                # several hundred ms on subsequent calls. The websocket library cannot
+                # respond to keepalive pings while the server is busy doing inference
+                # in the same thread, so the default 20s ping_timeout would drop the
+                # connection in the middle of a slow first call.
                 conn = websockets.sync.client.connect(
-                    self._uri, compression=None, max_size=None, additional_headers=headers
+                    self._uri,
+                    compression=None,
+                    max_size=None,
+                    additional_headers=headers,
+                    ping_interval=None,
+                    ping_timeout=None,
+                    close_timeout=None,
+                    open_timeout=None,
                 )
                 metadata = msgpack_numpy.unpackb(conn.recv())
                 return conn, metadata

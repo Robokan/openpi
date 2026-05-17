@@ -393,6 +393,68 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
     return final_state_dict
 
 
+def _merge_lora_into_base(flat_params: dict, scaling: float = 1.0) -> dict:
+    """Merge LoRA delta weights into their base weight tensors and drop the LoRA keys.
+
+    JAX checkpoint stores LoRA as separate `lora_a` / `lora_b` matrices alongside the
+    base weight `w` (or alongside a same-named base parameter for FeedForward layers).
+    The PyTorch model has no LoRA layers, so we must fold the deltas into the base
+    weight before exporting. With `alpha == rank` (which is the case for pi05 LoRA
+    configs: gemma_2b_lora rank=16/alpha=16, gemma_300m_lora rank=32/alpha=32),
+    the per-layer scaling is exactly 1.0.
+
+    Mutates and returns a NEW dict so the caller can decide what to do with it.
+    """
+    merged = dict(flat_params)
+    consumed = set()
+    pairs = []  # (lora_a_key, lora_b_key, base_key)
+
+    for k in list(merged.keys()):
+        if k.endswith("/lora_a"):
+            stem = k[: -len("/lora_a")]
+            pairs.append((k, stem + "/lora_b", stem + "/w"))
+        elif k.endswith("_lora_a"):
+            # FeedForward style: gating_einsum_lora_a sits next to gating_einsum
+            stem = k[: -len("_lora_a")]
+            pairs.append((k, stem + "_lora_b", stem))
+
+    if not pairs:
+        return merged
+
+    print(f"  Found {len(pairs)} LoRA weight pairs to merge into base weights")
+    for la_k, lb_k, base_k in pairs:
+        if base_k not in merged:
+            raise KeyError(f"LoRA base weight not found: {base_k} (referenced by {la_k})")
+        if lb_k not in merged:
+            raise KeyError(f"LoRA pair missing: {lb_k} for {la_k}")
+
+        w = merged[base_k]
+        la = merged[la_k]
+        lb = merged[lb_k]
+
+        # Sanity-check shapes: la is [..., in, rank], lb is [..., rank, out], w is [..., in, out]
+        if la.shape[:-2] != lb.shape[:-2] or la.shape[:-2] != w.shape[:-2]:
+            raise ValueError(
+                f"LoRA leading-dim mismatch for {base_k}: w={w.shape} la={la.shape} lb={lb.shape}"
+            )
+        if la.shape[-2] != w.shape[-2] or lb.shape[-1] != w.shape[-1] or la.shape[-1] != lb.shape[-2]:
+            raise ValueError(
+                f"LoRA inner-dim mismatch for {base_k}: w={w.shape} la={la.shape} lb={lb.shape}"
+            )
+
+        # matmul broadcasts over leading dims; treats last two dims as the matrix
+        delta = np.matmul(la.astype(np.float32), lb.astype(np.float32))
+        merged[base_k] = (w.astype(np.float32) + scaling * delta).astype(w.dtype)
+        consumed.add(la_k)
+        consumed.add(lb_k)
+
+    for k in consumed:
+        del merged[k]
+
+    print(f"  Merged LoRA into {len(pairs)} base weights ({len(consumed)} LoRA tensors dropped)")
+    return merged
+
+
 def slice_initial_orbax_checkpoint(checkpoint_dir: str, restore_precision: str | None = None):
     """Load and process params by restoring via JAX model loader first.
     This respects dtype conversions that occur during model restore.
@@ -402,7 +464,11 @@ def slice_initial_orbax_checkpoint(checkpoint_dir: str, restore_precision: str |
         f"{checkpoint_dir}/params/", restore_type=np.ndarray, dtype=restore_precision
     )
 
-    return {"paligemma_params": traversals.flatten_mapping(params["PaliGemma"], sep="/"), "projection_params": params}
+    paligemma_flat = traversals.flatten_mapping(params["PaliGemma"], sep="/")
+    # CRITICAL: merge LoRA deltas into base weights before slicing, otherwise the
+    # PyTorch checkpoint will contain only the un-fine-tuned base model.
+    paligemma_flat = _merge_lora_into_base(paligemma_flat, scaling=1.0)
+    return {"paligemma_params": paligemma_flat, "projection_params": params}
 
 
 def load_jax_model_and_print_keys(checkpoint_dir: str):

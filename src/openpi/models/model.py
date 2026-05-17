@@ -243,7 +243,17 @@ class BaseModelConfig(abc.ABC):
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
-        safetensors.torch.load_model(model, weight_path)
+        # Use load_file + load_state_dict(strict=False) instead of safetensors.torch.load_model
+        # because (a) our converted checkpoints are saved in bfloat16 while the model is
+        # instantiated in float32, which load_model treats as a dtype mismatch and rejects, and
+        # (b) some converted keys (e.g. tied lm_head weights) intentionally don't appear in the
+        # safetensors file.
+        state_dict = safetensors.torch.load_file(weight_path)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if unexpected:
+            logger.warning(f"PyTorch load: {len(unexpected)} unexpected keys in checkpoint, e.g. {unexpected[:3]}")
+        if missing:
+            logger.info(f"PyTorch load: {len(missing)} missing keys (typically tied weights), e.g. {missing[:3]}")
         return model
 
     @abc.abstractmethod

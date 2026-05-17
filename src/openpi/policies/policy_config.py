@@ -52,7 +52,16 @@ def create_trained_policy(
     logging.info("Loading model...")
     if is_pytorch:
         model = train_config.model.load_pytorch(train_config, weight_path)
-        model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+        # Allow overriding the inference precision via env var. Useful when the checkpoint
+        # was converted from a LoRA-finetuned JAX model: the merged-then-cast bf16 weights
+        # can lose the LoRA contribution because the per-weight delta is comparable to the
+        # bf16 quantization step at the base weight magnitude. Running in float32 preserves
+        # the merged LoRA fully.
+        pt_precision = os.environ.get("OPENPI_PYTORCH_PRECISION", "bfloat16")
+        if pt_precision not in ("bfloat16", "float32"):
+            raise ValueError(f"OPENPI_PYTORCH_PRECISION must be 'bfloat16' or 'float32', got {pt_precision!r}")
+        logging.info(f"Casting PyTorch model to {pt_precision}")
+        model.paligemma_with_expert.to_bfloat16_for_selected_params(pt_precision)
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
