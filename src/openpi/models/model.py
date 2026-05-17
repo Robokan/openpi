@@ -243,13 +243,26 @@ class BaseModelConfig(abc.ABC):
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
-        # Use load_file + load_state_dict(strict=False) instead of safetensors.torch.load_model
-        # because (a) our converted checkpoints are saved in bfloat16 while the model is
-        # instantiated in float32, which load_model treats as a dtype mismatch and rejects, and
-        # (b) some converted keys (e.g. tied lm_head weights) intentionally don't appear in the
-        # safetensors file.
+        # Use load_file + load_state_dict(strict=False, assign=True) instead of
+        # safetensors.torch.load_model because:
+        # (a) our converted checkpoints may be saved in a different dtype than the
+        #     freshly-instantiated model (e.g. fp32 file vs bf16 init for the
+        #     gemma_expert), which safetensors.torch.load_model rejects, and
+        # (b) some converted keys (e.g. tied lm_head weights) intentionally don't
+        #     appear in the safetensors file.
+        # CRITICAL: assign=True is required. With assign=False (the PyTorch default),
+        # load_state_dict copies the file tensors INTO the model's existing
+        # parameters and converts dtype to match the parameter. For our pi05
+        # LoRA-merged checkpoints (fp32 file) that means the action-expert weights
+        # would be round-tripped through bf16, which has a relative precision of
+        # ~0.4%. The LoRA delta (lora_a @ lora_b * scaling) has magnitudes around
+        # 1e-3..1e-2, which is at or below the bf16 quantization step for typical
+        # base-weight magnitudes -- so the LoRA contribution gets silently rounded
+        # away. With assign=True the safetensors tensors REPLACE the parameters,
+        # preserving the file's dtype until the explicit precision cast that
+        # policy_config performs after load.
         state_dict = safetensors.torch.load_file(weight_path)
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False, assign=True)
         if unexpected:
             logger.warning(f"PyTorch load: {len(unexpected)} unexpected keys in checkpoint, e.g. {unexpected[:3]}")
         if missing:
