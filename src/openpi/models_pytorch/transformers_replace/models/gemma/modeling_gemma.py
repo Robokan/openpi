@@ -510,8 +510,14 @@ class GemmaModel(GemmaPreTrainedModel):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # normalized
-        # Gemma downcasts the below to float16, causing sqrt(3072)=55.4256 to become 55.5
-        # See https://github.com/huggingface/transformers/pull/29402
+        # NOTE: pi0_pytorch.embed_prefix already scales the language tokens by
+        # sqrt(hidden_size) BEFORE calling this forward, mirroring JAX's
+        # Embedder.encode (which only scales language tokens, not image features).
+        # Doing the scaling here would double-scale language tokens and wrongly
+        # scale image tokens, both of which diverge from the JAX implementation.
+        # We therefore leave this disabled. See the upstream HF dtype fix
+        # (transformers PR #29402) for the reason the original computation is
+        # split into a separate float32 tensor.
         normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=hidden_states.dtype)
         #hidden_states = hidden_states * normalizer
 
