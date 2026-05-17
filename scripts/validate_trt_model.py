@@ -32,7 +32,7 @@ from openpi.training import config as _config
 class Args:
     config: str = "pi05_openarm_ngc_lora_v4"
     checkpoint_dir: str = "/checkpoints/pi05_openarm_ngc_lora_v4/chocolate_bars_pi05_pytorch"
-    engine_path: str = "/checkpoints/pi05_openarm_ngc_lora_v4/chocolate_bars_pi05_pytorch/model_fp4.engine"
+    engine_path: str = "/checkpoints/pi05_openarm_ngc_lora_v4/chocolate_bars_pi05_pytorch/model_fp8.engine"
     num_tests: int = 5
 
 
