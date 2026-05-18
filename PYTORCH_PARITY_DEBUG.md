@@ -82,6 +82,19 @@ state values are positive (joint 3 state = 2.008 rad).
 
 ---
 
+## CRITICAL: `transformers_replace/` requires manual `docker cp` to apply
+
+The files in `src/openpi/models_pytorch/transformers_replace/` are NOT
+automatically imported. They must be **manually copied** into the
+container's transformers package:
+
+```bash
+docker cp src/openpi/models_pytorch/transformers_replace/models/gemma/modeling_gemma.py \
+  openpi-pt-server:/usr/local/lib/python3.12/dist-packages/transformers/models/gemma/modeling_gemma.py
+```
+
+This was a debugging gotcha — edits to those files appeared to do nothing.
+
 ## Fixes ALREADY applied (do not redo)
 
 These are committed; their effects on parity are below.
@@ -128,6 +141,22 @@ These are committed; their effects on parity are below.
    to `openpi-thor:latest` with `PYTHONPATH=/app/src:...` override so the
    container picks up the live source from the mounted workspace.
 
+9. **🆕 `rotary_emb.inv_freq` precision (MAY 2026)**
+   - `src/openpi/models_pytorch/gemma_pytorch.py:to_bfloat16_for_selected_params`
+   - The `self.to(dtype=torch.bfloat16)` call casts both PARAMETERS and
+     BUFFERS. The `GemmaRotaryEmbedding.inv_freq` buffer is fp32 by
+     default but got truncated to bf16, e.g. `inv_freq[1]` was
+     **0.9296875** instead of **0.9305720**. This compounded through
+     `cos/sin` at high positions, e.g. PT cos at pos 968 dim 1 was
+     **+0.129** vs JAX's **-0.665** — completely wrong RoPE rotation.
+   - Fix: walk submodules, re-run `rope_init_fn` to get fp32 inv_freq,
+     and overwrite the buffer.
+   - **Effect on actions**: ~1e-4 per-dimension change (i.e., very tiny;
+     the bf16 rounding of cos/sin AFTER the matmul cancels most of the
+     gain, and the model was likely trained to be robust to this).
+   - **Still a real bug** — keep the fix in. But not the source of the
+     8% chunk-level bias.
+
 ---
 
 ## Things ruled out (with evidence)
@@ -165,6 +194,19 @@ For each, the diagnostic that proved it's not the bug:
   gives **identical** actions to default `"high"`. TF32 is not the bug.
 - `fp32_attention` enabled/disabled (`OPENPI_PT_FP32_ATTN`): improves
   per-layer prefix parity but does not change end-to-end action bias.
+- **🆕 torch.compile vs eager** (`OPENPI_PT_DISABLE_COMPILE=1`): gives
+  **identical** end-to-end actions. The earlier "compile gives cos=0.85
+  but eager gives cos=-0.96" comment in code was about pi05_libero
+  with ZERO inputs — does NOT apply to pi05_openarm with real obs.
+- **🆕 AdaRMS modulation in bf16 vs fp32**: identical results. The
+  AdaRMS dense weight is fp32 (kept by `params_to_keep_float32`), and
+  forcing bf16 matmul there changes nothing.
+- **🆕 RoPE precision fp32 vs bf16-truncated inv_freq**: changes
+  per-element output by ~1e-4. Trivial relative to 8% chunk bias.
+- **Conclusion**: The bug is NOT precision-related. NVIDIA reports FP4
+  quantized pi05 works, which is consistent — if FP4 works, then
+  bf16-vs-fp32 mismatches on the order of 0.4% per element cannot
+  produce an 8% systematic chunk bias. The bug must be ALGORITHMIC.
 
 ### Diffusion loop
 - JAX and PT loops are byte-equivalent:
@@ -270,6 +312,27 @@ docker exec openpi-pt-server bash -lc \
 | `OPENPI_PT_MATMUL_PRECISION` | `high` | `highest` for strict fp32, `medium` for bf16 |
 
 ---
+
+## Algorithmic checks done (verified identical between JAX and PT)
+
+These were CONFIRMED to be structurally / mathematically the same:
+
+- `embed_prefix`: image features cos=0.9999, lang `* sqrt(2048)` scaling
+  applied in both JAX (`Embedder.encode`) and PT (`embed_prefix`).
+- `embed_suffix`: for pi05, both:
+  - action_tokens = action_in_proj(noisy_actions)
+  - time_emb = posemb_sincos(t) ... -> time_mlp_in -> swish -> time_mlp_out -> swish
+  - adarms_cond = time_emb
+  - tokens = action_tokens (NO state token, NO time token in suffix)
+  - ar_mask = [True] + [False] * (action_horizon - 1)
+- `make_attn_mask`: `cumsum_ar <= cumsum_ar` AND `pad_i * pad_j`. Same.
+- KV cache reuse: both compute prefix-only forward to fill cache, then
+  expert forward on suffix attending to cached prefix K, V.
+- `_gated_residual`: `x + y * gate` (or `x + y` if gate is None). Same.
+- `_apply_rope` (JAX) vs `apply_rotary_pos_emb` (PT): mathematically
+  equivalent (different but congruent formulations).
+- LoRA merge math: `merged = base + scaling * (la @ lb)` for both attn
+  einsum and FFN. scaling=1.0 confirmed for our checkpoints (alpha=rank).
 
 ## Still-open investigation paths
 

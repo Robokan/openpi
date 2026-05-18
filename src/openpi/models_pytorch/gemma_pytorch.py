@@ -1,3 +1,4 @@
+import os
 from typing import Literal
 
 import pytest
@@ -114,6 +115,37 @@ class PaliGemmaWithExpertModel(nn.Module):
         for name, param in self.named_parameters():
             if any(selector in name for selector in params_to_keep_float32):
                 param.data = param.data.to(dtype=torch.float32)
+
+        # CRITICAL FIX: `self.to(dtype=torch.bfloat16)` above casts BUFFERS as
+        # well as parameters. The `inv_freq` buffer of every `GemmaRotaryEmbedding`
+        # gets truncated from fp32 to bf16, losing ~3 decimal digits of precision
+        # (e.g. inv_freq[1] 0.9305720 -> 0.9296875). This compounds through cos/sin
+        # at every position and propagates through all 18 layers x 10 denoise
+        # steps, producing a ~8% chunk-level magnitude bias on PT actions vs JAX
+        # (joint 3 +0.135 rad / "arms drift upward" on OpenArm).
+        #
+        # We restore inv_freq to fp32 here. JAX computes RoPE in fp32 throughout
+        # (`_apply_rope` line 426: `dtype=jnp.float32`), so this just matches JAX.
+        for name, buf in self.named_buffers():
+            if name.endswith("rotary_emb.inv_freq") and buf.dtype != torch.float32:
+                # Re-attach as fp32. We can't easily compute fresh inv_freq here
+                # without knowing the module's config, so we upcast the existing
+                # buffer and accept the bf16->fp32 promotion (still better than
+                # bf16 throughout). Then we also re-initialize via the original
+                # rope_init_fn for any RotaryEmbedding modules we can find.
+                buf.data = buf.data.to(dtype=torch.float32)
+
+        # Re-initialize inv_freq from the config to recover full fp32 precision
+        # (the .to(fp32) above only widens the dtype but the values were already
+        # truncated to bf16-representable). We do this by walking submodules and
+        # re-running their rope_init_fn.
+        for module in self.modules():
+            if hasattr(module, "rope_init_fn") and hasattr(module, "inv_freq"):
+                try:
+                    new_inv_freq, _ = module.rope_init_fn(module.config, device=module.inv_freq.device)
+                    module.inv_freq.data = new_inv_freq.to(dtype=torch.float32)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def embed_image(self, image: torch.Tensor):
         return self.paligemma.model.get_image_features(image)
@@ -249,11 +281,19 @@ class PaliGemmaWithExpertModel(nn.Module):
                     .expand(batch_size, value_states.shape[1], num_kv_groups, seq_len, head_dim_kv)
                     .reshape(batch_size, -1, seq_len, head_dim_kv)
                 )
-                att_output = fp32_attention(
-                    query_states, k_expanded, v_expanded,
-                    additive_mask_4d=attention_mask,
-                    scaling=scaling,
-                )
+                if os.environ.get("OPENPI_PT_FP32_ATTN", "1") != "0":
+                    att_output = fp32_attention(
+                        query_states, k_expanded, v_expanded,
+                        additive_mask_4d=attention_mask,
+                        scaling=scaling,
+                    )
+                else:
+                    # Default bf16 SDPA-style attention (no fp32 logit accumulator).
+                    # Comparison anchor for OPENPI_PT_FP32_ATTN ablation.
+                    _logits = torch.matmul(query_states, k_expanded.transpose(-1, -2)) * scaling
+                    _logits = _logits + attention_mask
+                    _probs = torch.softmax(_logits, dim=-1)
+                    att_output = torch.matmul(_probs, v_expanded)
                 # att_output: (B, num_heads, T, head_dim) -> (B, T, num_heads*head_dim)
                 att_output = att_output.transpose(1, 2).contiguous()
                 head_dim = self_attn.head_dim

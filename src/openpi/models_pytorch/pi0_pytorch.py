@@ -124,7 +124,8 @@ class PI0Pytorch(nn.Module):
         # XLA matmuls than eager PyTorch's pure bf16 reductions do. Disabling
         # torch.compile leaks bf16-accumulation noise (compounded across 18 layers x
         # 10 denoise steps) and destroys agreement with JAX.
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+        if _os.environ.get("OPENPI_PT_DISABLE_COMPILE", "0") != "1":
+            self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False

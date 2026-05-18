@@ -84,21 +84,12 @@ class GemmaRMSNorm(nn.Module):
         if cond.shape[-1] != self.cond_dim:
             raise ValueError(f"Expected cond dimension {self.cond_dim}, got {cond.shape[-1]}")
         
-        #self.dense.to(dtype=torch.bfloat16).to(dtype=torch.float32)
         modulation = self.dense(cond)
-        # Reshape modulation to broadcast properly: [batch, 1, features] for [batch, seq, features]
+
         if len(x.shape) == 3:  # [batch, seq, features]
             modulation = modulation.unsqueeze(1)
-        
+
         scale, shift, gate = torch.chunk(modulation, 3, dim=-1)
-        
-        # Apply adaptive normalization: use model weight dtype to ensure compatibility
-        # model_dtype = self.dense.weight.dtype  # Use the model's dtype (bfloat16)
-        # scale = scale.to(model_dtype)
-        # shift = shift.to(model_dtype)
-        # gate = gate.to(model_dtype)
-        # normed_inputs = normed_inputs.to(model_dtype)  # Convert normed_inputs to model dtype
-        
         normed_inputs = normed_inputs * (1 + scale.to(torch.float32)) + shift.to(torch.float32)
 
         return normed_inputs.to(dtype), gate.to(dtype)
