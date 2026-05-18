@@ -7,7 +7,7 @@ from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
-from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
+from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel, fp32_attention
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 from transformers.models.gemma import modeling_gemma
 
@@ -453,14 +453,13 @@ class PI0Pytorch(nn.Module):
                 .reshape(batch_size_, -1, seq_len, value_states.shape[-1])
             )
 
-            att_output = torch.nn.functional.scaled_dot_product_attention(
-                query_states,
-                key_expanded,
-                value_expanded,
-                attn_mask=prefix_att_2d_masks_4d.to(query_states.dtype),
-                dropout_p=0.0,
-                is_causal=False,
-                scale=layer.self_attn.scaling,
+            # JAX uses fp32-accumulator einsum (preferred_element_type=jnp.float32) for
+            # attention logits. PT's SDPA stays in bf16, which compounds error over
+            # ~1000 keys and drops language-token cos to ~0.65. Use fp32 attention.
+            att_output = fp32_attention(
+                query_states, key_expanded, value_expanded,
+                additive_mask_4d=prefix_att_2d_masks_4d,
+                scaling=layer.self_attn.scaling,
             )
             head_dim = layer.self_attn.head_dim
             num_heads = layer.self_attn.config.num_attention_heads
@@ -579,14 +578,13 @@ class PI0Pytorch(nn.Module):
                 .reshape(batch_size_, -1, total_len, full_value_states.shape[-1])
             )
 
-            att_output = F.scaled_dot_product_attention(
-                query_states,
-                key_expanded,
-                value_expanded,
-                attn_mask=full_att_masks_4d.to(query_states.dtype),
-                dropout_p=0.0,
-                is_causal=False,
-                scale=layer.self_attn.scaling,
+            # Match JAX: compute Q @ K^T + softmax in fp32. See `fp32_attention`
+            # docstring; without this the suffix forward inherits the same drift
+            # the prefix had.
+            att_output = fp32_attention(
+                query_states, key_expanded, value_expanded,
+                additive_mask_4d=full_att_masks_4d,
+                scaling=layer.self_attn.scaling,
             )
             att_output = att_output.transpose(1, 2).contiguous()
             head_dim = layer.self_attn.head_dim

@@ -9,6 +9,39 @@ from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
 
+def fp32_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                   additive_mask_4d: torch.Tensor, scaling: float) -> torch.Tensor:
+    """Attention with fp32 logits + softmax, matching JAX's
+    `jnp.einsum(..., preferred_element_type=jnp.float32)` semantics.
+
+    PyTorch's `scaled_dot_product_attention` and `eager_attention_forward` keep
+    Q @ K^T in the input dtype (bf16 at inference). With ~1000-token prefix
+    sequences the bf16 accumulator drifts significantly, primarily on language
+    tokens at high positions (cos ~0.65 vs JAX). Computing the matmul + softmax
+    in fp32 (and downcasting probs before the V matmul) recovers near-perfect
+    parity with the JAX prefix forward.
+
+    Args:
+        query: (B, H, T, D) in any float dtype.
+        key:   (B, H, S, D) in any float dtype (post-GQA repeat).
+        value: (B, H, S, D) in any float dtype.
+        additive_mask_4d: (B, 1, T, S) float mask with 0 or -big_neg.
+        scaling: scalar attention scale (typically 1/sqrt(head_dim)).
+
+    Returns:
+        attention output, shape (B, H, T, D), in the input query.dtype.
+    """
+    orig_dtype = query.dtype
+    q_f32 = query.float()
+    k_f32 = key.float()
+    v_f32 = value.float()
+    logits = torch.matmul(q_f32, k_f32.transpose(-1, -2)) * scaling
+    logits = logits + additive_mask_4d.float()
+    probs = torch.softmax(logits, dim=-1)
+    out = torch.matmul(probs, v_f32)
+    return out.to(orig_dtype)
+
+
 class PaliGemmaWithExpertModel(nn.Module):
     def __init__(
         self,
@@ -195,19 +228,35 @@ class PaliGemmaWithExpertModel(nn.Module):
                 )
 
                 batch_size = query_states.shape[0]
-                scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
+                self_attn = self.paligemma.language_model.layers[layer_idx].self_attn
+                scaling = self_attn.scaling
 
-                # Attention computation
-                att_output, _ = modeling_gemma.eager_attention_forward(
-                    self.paligemma.language_model.layers[layer_idx].self_attn,
-                    query_states,
-                    key_states,
-                    value_states,
-                    attention_mask,
-                    scaling,
+                # JAX uses fp32-accumulator einsum (preferred_element_type=jnp.float32)
+                # for attention logits. PT's eager attention stays in bf16, which drops
+                # language-token cos to ~0.65 vs JAX over ~1000 prefix keys. Use fp32
+                # attention to recover parity.
+                # K, V are not yet GQA-expanded; expand here (matches eager_attention_forward).
+                num_kv_groups = self_attn.num_key_value_groups
+                seq_len = key_states.shape[2]
+                head_dim_kv = key_states.shape[-1]
+                k_expanded = (
+                    key_states[:, :, None, :, :]
+                    .expand(batch_size, key_states.shape[1], num_kv_groups, seq_len, head_dim_kv)
+                    .reshape(batch_size, -1, seq_len, head_dim_kv)
                 )
-                # Get head_dim from the current layer, not from the model
-                head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim
+                v_expanded = (
+                    value_states[:, :, None, :, :]
+                    .expand(batch_size, value_states.shape[1], num_kv_groups, seq_len, head_dim_kv)
+                    .reshape(batch_size, -1, seq_len, head_dim_kv)
+                )
+                att_output = fp32_attention(
+                    query_states, k_expanded, v_expanded,
+                    additive_mask_4d=attention_mask,
+                    scaling=scaling,
+                )
+                # att_output: (B, num_heads, T, head_dim) -> (B, T, num_heads*head_dim)
+                att_output = att_output.transpose(1, 2).contiguous()
+                head_dim = self_attn.head_dim
                 att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
 
                 # Process layer outputs
