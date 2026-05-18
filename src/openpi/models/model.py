@@ -267,6 +267,31 @@ class BaseModelConfig(abc.ABC):
             logger.warning(f"PyTorch load: {len(unexpected)} unexpected keys in checkpoint, e.g. {unexpected[:3]}")
         if missing:
             logger.info(f"PyTorch load: {len(missing)} missing keys (typically tied weights), e.g. {missing[:3]}")
+
+        # CRITICAL fix for assign=True breaking weight tying.
+        # HuggingFace PaliGemma ties `lm_head.weight` to `model.language_model.embed_tokens.weight`
+        # at construction. With assign=True, load_state_dict ASSIGNS new tensors to
+        # parameters present in the safetensors file, breaking that aliasing. Our
+        # converted checkpoints save only `lm_head.weight` (saving once for tied
+        # weights is the default safetensors behavior), so after load the
+        # `embed_tokens.weight` is left at random init -- which makes ALL language
+        # tokens random and gives the model uncorrelated outputs vs the JAX
+        # reference (cos ~= 0 on the language-token slice of embed_prefix).
+        # Re-tie explicitly here so embed_tokens.weight points at the loaded
+        # lm_head.weight. Same fix for the gemma expert.
+        try:
+            pg = model.paligemma_with_expert.paligemma
+            pg.model.language_model.embed_tokens.weight = pg.lm_head.weight
+            logger.info("Re-tied paligemma embed_tokens.weight to lm_head.weight after assign=True load.")
+        except AttributeError as e:
+            logger.warning(f"Could not re-tie paligemma embed_tokens to lm_head: {e}")
+        try:
+            ge = model.paligemma_with_expert.gemma_expert
+            ge.model.embed_tokens.weight = ge.lm_head.weight
+            logger.info("Re-tied gemma_expert embed_tokens.weight to lm_head.weight after assign=True load.")
+        except AttributeError as e:
+            logger.warning(f"Could not re-tie gemma_expert embed_tokens to lm_head: {e}")
+
         return model
 
     @abc.abstractmethod

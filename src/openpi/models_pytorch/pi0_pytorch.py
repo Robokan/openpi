@@ -9,6 +9,7 @@ import torch.nn.functional as F  # noqa: N812
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+from transformers.models.gemma import modeling_gemma
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -273,15 +274,13 @@ class PI0Pytorch(nn.Module):
         time_emb = create_sinusoidal_pos_embedding(
             timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0, device=timestep.device
         )
-        # Cast time_emb + noisy_actions to the action_in_proj's weight dtype so that the
-        # subsequent matmul happens in model dtype (typically bf16 at inference time).
-        # This matches TurboPi's denoise path and avoids implicit float32 -> bf16 casts
-        # *inside* nn.Linear that can change rounding compared to JAX.
-        model_dtype = self.action_in_proj.weight.dtype
-        time_emb = time_emb.to(dtype=model_dtype)
+        # Keep time_emb as fp32 to match JAX's pi0.py behavior (line 161: posemb_sincos
+        # returns fp32). Letting nn.Linear handle the fp32->bf16 matmul preserves the
+        # JAX semantics where the matmul is computed at the input's precision.
+        time_emb = time_emb.type(dtype=timestep.dtype)
 
         def action_proj_func(noisy_actions):
-            return self.action_in_proj(noisy_actions.to(model_dtype))
+            return self.action_in_proj(noisy_actions)
 
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 
@@ -385,37 +384,249 @@ class PI0Pytorch(nn.Module):
 
         return F.mse_loss(u_t, v_t, reduction="none")
 
+    def compute_prefix_kv_cache(
+        self,
+        prefix_embs: torch.Tensor,
+        prefix_pad_masks: torch.Tensor,
+        prefix_att_masks: torch.Tensor,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Compute and cache K, V tensors for the (image + language) prefix tokens
+        layer-by-layer through PaliGemma. Returns a list of (K, V) tuples (one per
+        layer); each K/V already has RoPE applied. The cache is reused across all
+        denoise steps in sample_actions, so the expensive prefix forward runs once
+        per inference call instead of `num_steps` times.
+
+        Mirrors TurboPi's `compute_prefix_kv_cache` (Jetson Thor, 100% LIBERO),
+        which is in turn the PyTorch equivalent of JAX's prefix KVCache.
+        """
+        paligemma_lm = self.paligemma_with_expert.paligemma.language_model
+        num_layers = paligemma_lm.config.num_hidden_layers
+
+        if paligemma_lm.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+
+        position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        kv_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+        hidden_states = prefix_embs
+
+        for layer_idx in range(num_layers):
+            layer = paligemma_lm.layers[layer_idx]
+
+            normed_hidden, _ = layer.input_layernorm(hidden_states, cond=None)
+
+            input_shape = normed_hidden.shape[:-1]
+            hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+            query_states = layer.self_attn.q_proj(normed_hidden).view(hidden_shape).transpose(1, 2)
+            key_states = layer.self_attn.k_proj(normed_hidden).view(hidden_shape).transpose(1, 2)
+            value_states = layer.self_attn.v_proj(normed_hidden).view(hidden_shape).transpose(1, 2)
+
+            dummy_tensor = torch.zeros(
+                query_states.shape[0],
+                query_states.shape[2],
+                query_states.shape[-1],
+                device=query_states.device,
+                dtype=query_states.dtype,
+            )
+            cos, sin = paligemma_lm.rotary_emb(dummy_tensor, position_ids)
+            query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, unsqueeze_dim=1
+            )
+
+            kv_cache.append((key_states.clone(), value_states.clone()))
+
+            batch_size_ = query_states.shape[0]
+            seq_len = query_states.shape[2]
+            num_kv_groups = layer.self_attn.num_key_value_groups
+
+            key_expanded = (
+                key_states[:, :, None, :, :]
+                .expand(batch_size_, key_states.shape[1], num_kv_groups, seq_len, key_states.shape[-1])
+                .reshape(batch_size_, -1, seq_len, key_states.shape[-1])
+            )
+            value_expanded = (
+                value_states[:, :, None, :, :]
+                .expand(batch_size_, value_states.shape[1], num_kv_groups, seq_len, value_states.shape[-1])
+                .reshape(batch_size_, -1, seq_len, value_states.shape[-1])
+            )
+
+            att_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                key_expanded,
+                value_expanded,
+                attn_mask=prefix_att_2d_masks_4d.to(query_states.dtype),
+                dropout_p=0.0,
+                is_causal=False,
+                scale=layer.self_attn.scaling,
+            )
+            head_dim = layer.self_attn.head_dim
+            num_heads = layer.self_attn.config.num_attention_heads
+            att_output = att_output.transpose(1, 2).reshape(batch_size_, seq_len, num_heads * head_dim)
+
+            if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
+                att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+            out_emb = layer.self_attn.o_proj(att_output)
+
+            out_emb = hidden_states + out_emb
+            after_first_residual = out_emb.clone()
+
+            out_emb, _ = layer.post_attention_layernorm(out_emb, cond=None)
+            if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
+                out_emb = out_emb.to(dtype=torch.bfloat16)
+
+            out_emb = layer.mlp(out_emb)
+
+            hidden_states = after_first_residual + out_emb
+
+        return kv_cache
+
+    def denoise_step_with_cache(
+        self,
+        state: torch.Tensor,
+        prefix_kv_cache: list[tuple[torch.Tensor, torch.Tensor]],
+        prefix_pad_masks: torch.Tensor,
+        x_t: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> torch.Tensor:
+        """One denoise step using the cached prefix K, V from
+        `compute_prefix_kv_cache`. Only the suffix (state + action) tokens go
+        through Gemma Expert; the         suffix Q attends to (cached prefix K, V) ++
+        (freshly computed suffix K, V). This is the JAX-equivalent KVCache reuse
+        path and matches TurboPi's `denoise_step_with_cache`.
+        """
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            state, x_t, timestep
+        )
+
+        gemma_expert = self.paligemma_with_expert.gemma_expert.model
+        paligemma_lm = self.paligemma_with_expert.paligemma.language_model
+        num_layers = gemma_expert.config.num_hidden_layers
+
+        batch_size_ = suffix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+        suffix_len = suffix_pad_masks.shape[1]
+
+        if gemma_expert.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+
+        # Suffix queries attend to (valid prefix tokens) + (suffix tokens).
+        # Build a (B, suffix_len, prefix_len + suffix_len) bool mask:
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        suffix_to_prefix_masks = prefix_pad_masks[:, None, :].expand(batch_size_, suffix_len, prefix_len)
+        full_att_masks = torch.cat([suffix_to_prefix_masks, suffix_att_2d_masks], dim=2)
+        full_att_masks_4d = self._prepare_attention_masks_4d(full_att_masks)
+
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        suffix_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+
+        hidden_states = suffix_embs
+
+        for layer_idx in range(num_layers):
+            layer = gemma_expert.layers[layer_idx]
+            cached_key, cached_value = prefix_kv_cache[layer_idx]
+
+            normed_hidden, gate = layer.input_layernorm(hidden_states, cond=adarms_cond)
+
+            input_shape = normed_hidden.shape[:-1]
+            hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+            query_states = layer.self_attn.q_proj(normed_hidden).view(hidden_shape).transpose(1, 2)
+            key_states = layer.self_attn.k_proj(normed_hidden).view(hidden_shape).transpose(1, 2)
+            value_states = layer.self_attn.v_proj(normed_hidden).view(hidden_shape).transpose(1, 2)
+
+            # RoPE on suffix only, with suffix positions continuing past prefix end.
+            dummy_tensor = torch.zeros(
+                query_states.shape[0],
+                query_states.shape[2],
+                query_states.shape[-1],
+                device=query_states.device,
+                dtype=query_states.dtype,
+            )
+            cos, sin = paligemma_lm.rotary_emb(dummy_tensor, suffix_position_ids)
+            query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, unsqueeze_dim=1
+            )
+
+            full_key_states = torch.cat([cached_key, key_states], dim=2)
+            full_value_states = torch.cat([cached_value, value_states], dim=2)
+
+            # GQA expand: 1 KV head -> num_kv_groups Q heads (matches the
+            # eager_attention_forward path used in the no-cache branch).
+            num_kv_groups = layer.self_attn.num_key_value_groups
+            total_len = full_key_states.shape[2]
+            key_expanded = (
+                full_key_states[:, :, None, :, :]
+                .expand(
+                    batch_size_,
+                    full_key_states.shape[1],
+                    num_kv_groups,
+                    total_len,
+                    full_key_states.shape[-1],
+                )
+                .reshape(batch_size_, -1, total_len, full_key_states.shape[-1])
+            )
+            value_expanded = (
+                full_value_states[:, :, None, :, :]
+                .expand(
+                    batch_size_,
+                    full_value_states.shape[1],
+                    num_kv_groups,
+                    total_len,
+                    full_value_states.shape[-1],
+                )
+                .reshape(batch_size_, -1, total_len, full_value_states.shape[-1])
+            )
+
+            att_output = F.scaled_dot_product_attention(
+                query_states,
+                key_expanded,
+                value_expanded,
+                attn_mask=full_att_masks_4d.to(query_states.dtype),
+                dropout_p=0.0,
+                is_causal=False,
+                scale=layer.self_attn.scaling,
+            )
+            att_output = att_output.transpose(1, 2).contiguous()
+            head_dim = layer.self_attn.head_dim
+            num_heads = layer.self_attn.config.num_attention_heads
+            att_output = att_output.reshape(batch_size_, -1, num_heads * head_dim)
+
+            if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
+                att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+            out_emb = layer.self_attn.o_proj(att_output)
+
+            out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gate)  # noqa: SLF001
+            after_first_residual = out_emb.clone()
+
+            out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond)
+            if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
+                out_emb = out_emb.to(dtype=torch.bfloat16)
+
+            out_emb = layer.mlp(out_emb)
+
+            hidden_states = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
+
+        hidden_states, _ = gemma_expert.norm(hidden_states, cond=adarms_cond)
+
+        suffix_out = hidden_states[:, -self.config.action_horizon :]
+        suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
+        return self.action_out_proj(suffix_out)
+
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors).
 
-        IMPORTANT: This implementation passes BOTH `prefix_embs` and `suffix_embs` to
-        `PaliGemmaWithExpert.forward` on EVERY denoise step. This is the
-        JAX-equivalent path (the `else` branch of gemma_pytorch.PaliGemmaWithExpert.forward,
-        i.e. `compute_layer_complete`).
-
-        The previous implementation pre-computed a prefix KV cache via
-        `paligemma.language_model.forward(inputs_embeds=[prefix, None], use_cache=True)`
-        and then on each step called the model with `inputs_embeds=[None, suffix]`
-        + `past_key_values=cache`. That routes through the second branch of
-        PaliGemmaWithExpert.forward, which calls `gemma_expert.model.forward(...)`
-        directly with the paligemma-produced HF DynamicCache. That path
-        produces wildly different actions from JAX on real observations (cos(JAX,PT)
-        as low as -0.91 on pi05_libero with neutral inputs), because HF's
-        `GemmaModel.forward` + past_key_values does not faithfully reproduce the
-        JAX prefix-then-suffix attention semantics used by pi0.5.
-
-        TurboPi (https://github.com/.../TurboPi) confirms this empirically: their
-        `denoise_step_no_cache` is structurally equivalent to the implementation
-        below, is explicitly documented as "the correct implementation that
-        matches JAX behavior", and yields 100% LIBERO accuracy on Jetson Thor.
-
-        We sacrifice the prefix-KV-cache speedup for correctness here. A correct
-        prefix-KV-cache implementation (mirroring JAX's KVCache reuse) is a
-        valuable optimization but requires a custom layer-by-layer attention
-        loop (cf. TurboPi's compute_prefix_kv_cache / denoise_step_with_cache).
-        Left as a follow-up.
+        Set env var OPENPI_PT_NO_KVCACHE=1 to run the slow but
+        explicitly-correct joint-forward path (both prefix+suffix every step
+        through PaliGemmaWithExpert.forward) instead of the KV-cache fast path.
+        Useful for parity debugging against JAX.
         """
+        import os  # noqa: PLC0415
+
+        use_kv_cache = os.environ.get("OPENPI_PT_NO_KVCACHE", "0") != "1"
+
         bsize = observation.state.shape[0]
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
@@ -427,30 +638,46 @@ class PI0Pytorch(nn.Module):
         prefix_len = prefix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
 
-        # Use eager attention for the joint forward (the compute_layer_complete
-        # branch in gemma_pytorch.py expects eager-style attention masks).
+        dt = -1.0 / num_steps
+        dt = torch.tensor(dt, dtype=torch.float32, device=device)
+
+        if use_kv_cache:
+            prefix_kv_cache = self.compute_prefix_kv_cache(prefix_embs, prefix_pad_masks, prefix_att_masks)
+
+            x_t = noise
+            time = torch.tensor(1.0, dtype=torch.float32, device=device)
+            while time >= -dt / 2:
+                expanded_time = time.expand(bsize)
+                v_t = self.denoise_step_with_cache(
+                    state,
+                    prefix_kv_cache,
+                    prefix_pad_masks,
+                    x_t,
+                    expanded_time,
+                )
+                x_t = x_t + dt * v_t
+                time += dt
+            return x_t
+
+        # Slow joint-forward path (debug / parity baseline). Both prefix and
+        # suffix tokens are passed jointly to PaliGemmaWithExpert.forward at
+        # every denoise step, matching JAX semantics exactly.
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        # Cast prefix embeddings to model dtype once (suffix is built per step).
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
         ):
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
-        # Constant prefix-side masks (don't change across denoise steps).
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-
-        dt = -1.0 / num_steps
-        dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
-
             suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
                 state, x_t, expanded_time
             )
@@ -461,10 +688,6 @@ class PI0Pytorch(nn.Module):
                 suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
 
             suffix_len = suffix_pad_masks.shape[1]
-
-            # Joint (prefix + suffix) 2D attention mask:
-            #   suffix can attend to all valid prefix tokens
-            #   prefix cannot attend to suffix (causal in time order)
             suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
             suffix_to_prefix_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
             prefix_to_suffix_masks = torch.zeros(
@@ -488,12 +711,7 @@ class PI0Pytorch(nn.Module):
                 adarms_cond=[None, adarms_cond],
             )
 
-            suffix_out = outputs_embeds[1]
-            suffix_out = suffix_out[:, -self.config.action_horizon :]
-            # Match TurboPi: cast to action_out_proj's weight dtype (typically bf16 at
-            # inference time, then policy_config does the explicit fp32 cast on the
-            # returned tensor). Using torch.float32 here forces an extra round-trip
-            # through fp32 inside this denoise step which JAX does not do.
+            suffix_out = outputs_embeds[1][:, -self.config.action_horizon :]
             suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
             v_t = self.action_out_proj(suffix_out)
 
