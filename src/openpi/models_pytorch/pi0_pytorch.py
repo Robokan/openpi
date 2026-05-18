@@ -109,7 +109,12 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
-        torch.set_float32_matmul_precision("high")
+        # Matmul precision: "high" (default) enables TF32 on Ampere+ for ~3x speedup
+        # on fp32 ops at ~bf16 precision; "highest" forces full fp32. Empirically
+        # "highest" gives ~identical end-to-end action parity vs JAX for pi05_openarm
+        # (cos=0.996 either way), so we keep "high" for speed.
+        import os as _os  # noqa: PLC0415
+        torch.set_float32_matmul_precision(_os.environ.get("OPENPI_PT_MATMUL_PRECISION", "high"))
         # NOTE: torch.compile is *kept* here even though TurboPi disables it.
         # Empirically (pi05_libero, zero inputs):
         #   * with torch.compile(max-autotune): cos(JAX, PT) ~= 0.85
