@@ -12,6 +12,101 @@ end-to-end actions after 10 diffusion steps + Unnormalize show consistent
 
 ---
 
+## ★ KEY 2026-05-18 FINDINGS
+
+### Confirmed: bug is LoRA-related, not base model
+
+`scripts/diag_no_lora.py` runs JAX with `lora_a/lora_b` zeroed AND PT
+loaded from a no-LoRA checkpoint (converted with `OPENPI_CONV_LORA_SCALING=0`).
+
+| Setting | cos(JAX,PT) | ratio (raw) | post-unnorm ratio | joint 3 diff |
+|---------|-------------|-------------|--------------------|---------------|
+| **With LoRA** (default)            | 0.996 | 0.918 | 1.084 | **+0.135 rad** |
+| **No LoRA** (zeroed both sides)    | 0.99996 | 0.999 | 1.0016 | **+0.003 rad** |
+
+**Conclusion:** Base PaliGemma + base gemma_300m forward is perfectly
+correct in PT. The 8% bias only appears once LoRA is applied. The bug
+is in LoRA pathway, not base model code.
+
+### Bug #1 (FIXED 2026-05-18): bf16 truncation during LoRA merge in converter
+
+`examples/convert_jax_model_to_pytorch.py:convert_pi0_checkpoint` used to
+instantiate `PI0Pytorch(model_config)` with `config.dtype="bfloat16"`,
+which internally calls `to_bfloat16_for_selected_params("bfloat16")`
+during PaliGemmaWithExpertModel init. The freshly-built model thus had
+**bf16 parameters**.
+
+Then `load_state_dict(all_params, strict=False)` (no `assign=True`)
+loaded our **fp32 LoRA-merged weights** into those bf16 parameters,
+silently casting them down. The per-element rounding step at bf16
+(~0.4% of base magnitude) is the same order of magnitude as the LoRA
+delta (~1-3% of base magnitude in norm, but per-element often smaller).
+The bf16 truncation destroyed ~1% of the LoRA contribution per weight.
+
+`scripts/diag_checkpoint_diff.py` shows the corruption:
+- BEFORE fix: `cos(jax_delta, pt_diff)=0.99` (note: NOT 1.0) and `ratio=1.01`
+  (the truncation is biased — the per-weight delta is systematically 1%
+  larger in the stored PT checkpoint than the JAX-computed delta).
+- AFTER fix: `cos=1.0000000` and `ratio=1.000000` for ALL LoRA pairs.
+
+**Fix**: Instantiate the conversion-time model with `dtype='float32'`
+(via `dataclasses.replace(model_config, dtype='float32')`), then standard
+`load_state_dict(strict=False)` is fp32→fp32 = no-op for dtype, preserving
+the LoRA precision. Tried `assign=True` first but that broke the HF
+PaliGemma `lm_head ↔ embed_tokens` weight tying — produced garbage
+inference. The fp32-init approach is clean.
+
+This fix is REAL: per-weight `cos(jax_delta, pt_diff)` went 0.99 → 1.0,
+and `ratio` went 1.01 → 1.00 across all 10×18 LoRA pairs.
+
+### Bug #2 (STILL OPEN): 8% magnitude bias persists despite exact LoRA merge
+
+Even with the FIXED checkpoint (LoRA delta now stored to fp32 exactly):
+- End-to-end `cos(JAX, PT)` = 0.996 (slightly better than 0.962 before)
+- End-to-end `ratio (raw)` = **0.918** (PT ~8% smaller in raw chunk norm)
+- End-to-end `ratio (post-unnorm)` = **1.084** (PT ~8% larger in real space)
+
+So Bug #1's fix removed the ~1% per-weight precision noise but the
+fundamental **PT's LoRA contribution is ~80% of JAX's LoRA contribution**
+remains.
+
+  - JAX-with-LoRA action norm: 17.93
+  - JAX-no-LoRA action norm:   13.54
+  - "LoRA effect" (JAX):       ~11.7 (Pythagorean)
+  - PT-with-LoRA action norm:  16.46
+  - PT-no-LoRA action norm:    13.52
+  - "LoRA effect" (PT):        ~9.4
+  - PT effect / JAX effect:    ~80%
+
+Tried (no effect):
+  - `OPENPI_PYTORCH_PRECISION=float32` (run inference in fp32 throughout)
+  - `OPENPI_PT_MATMUL_PRECISION=highest` (no TF32)
+  - `OPENPI_PT_FP32_ATTN=1` (fp32 attention accumulator) — already on
+  - `OPENPI_PT_DISABLE_COMPILE=1` (eager mode)
+  - `OPENPI_PT_ADARMS_BF16=1` (force bf16 adarms modulation, match JAX)
+
+None of these change the 8% bias. So it's not precision-related.
+
+Open hypotheses:
+  - LoRA-affected weights act differently in attention vs my mental model
+    (e.g., maybe the einsum equations include some `jnp.where`-based
+    masking that interacts with LoRA non-linearly)
+  - The FFN linear LoRA might be applied differently (look at
+    `gating_einsum_lora` vs `linear_lora` tuple structure in lora.py)
+  - There's another set of LoRA-affected weights I haven't accounted for
+  - JAX's `nn.remat` / `nn.scan` may modify the LoRA application semantics
+
+To investigate next:
+  - Pull a single attention layer's bf16 Q/K/V output for SAME x in both
+    JAX (with LoRA) and PT (with merged FIXED weight). If the layer
+    outputs differ by 20%, the bug is in that layer's compute. If they
+    match, the bug is downstream/cumulative.
+  - Layer-by-layer comparison through the expert (or PaliGemma)
+  - Check JAX's actual `Einsum.__call__` vs the lora.py code (maybe
+    the runtime path differs from the `lora.py` definition).
+
+---
+
 ## Setup
 
 | Component | Value |

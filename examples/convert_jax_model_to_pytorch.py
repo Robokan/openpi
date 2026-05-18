@@ -467,7 +467,13 @@ def slice_initial_orbax_checkpoint(checkpoint_dir: str, restore_precision: str |
     paligemma_flat = traversals.flatten_mapping(params["PaliGemma"], sep="/")
     # CRITICAL: merge LoRA deltas into base weights before slicing, otherwise the
     # PyTorch checkpoint will contain only the un-fine-tuned base model.
-    paligemma_flat = _merge_lora_into_base(paligemma_flat, scaling=1.0)
+    # `OPENPI_CONV_LORA_SCALING` env var lets us override scaling for ablation:
+    # set to "0" to produce a base-only PT model (LoRA contribution zeroed),
+    # which we can compare against JAX-with-lora-zeroed to isolate whether the
+    # PT-vs-JAX parity bug is in the base model code or in the LoRA conversion.
+    import os as _os  # noqa: PLC0415
+    _scaling = float(_os.environ.get("OPENPI_CONV_LORA_SCALING", "1.0"))
+    paligemma_flat = _merge_lora_into_base(paligemma_flat, scaling=_scaling)
     return {"paligemma_params": paligemma_flat, "projection_params": params}
 
 
@@ -576,13 +582,35 @@ def convert_pi0_checkpoint(
         expert_params, action_expert_config, num_expert=1, checkpoint_dir=checkpoint_dir, pi05=model_config.pi05
     )
 
-    # Instantiate model
-    pi0_model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_config)
+    # Instantiate model. NOTE: PI0Pytorch.__init__ -> PaliGemmaWithExpertModel
+    # internally calls `self.to_bfloat16_for_selected_params(config.dtype)` which
+    # downcasts the freshly-initialized weights to bf16 (when config.dtype="bfloat16").
+    # Then a plain `load_state_dict(strict=False)` would *cast our fp32 LoRA-merged
+    # weights down to bf16 to match the model's parameter dtype*, losing precision
+    # in the small LoRA delta. That bf16-truncation is exactly the source of the
+    # observed ~1% per-weight LoRA mismatch that compounds to ~8% post-unnormalize
+    # action magnitude bias on the OpenArm robot.
+    #
+    # FIX: instantiate the model with `dtype='float32'` so its parameters start
+    # in fp32. Then load_state_dict (default cast-to-dest-dtype) is a no-op for
+    # dtype, preserving the fp32 precision of the LoRA-merged weights. We can
+    # then optionally cast the WHOLE model to bf16 just before save (if the
+    # user requested precision='bfloat16'). The runtime cast in policy_config
+    # already handles the bf16 inference path with the correct `assign=True`
+    # mechanism, so saving fp32 is the safer canonical form.
+    #
+    # Crucially this avoids `assign=True` here, which breaks the lm_head <->
+    # embed_tokens weight tying (HF PaliGemma) and produces broken inference.
+    import dataclasses as _dc
+    fp32_model_config = _dc.replace(model_config, dtype="float32")
+    pi0_model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(fp32_model_config)
 
     # Combine all parameters (no prefix needed for our model structure)
     all_params = {**paligemma_params, **gemma_params, **projection_params}
 
-    # Load state dict
+    # Standard load_state_dict (NOT assign=True). Since the model is fp32, the
+    # implicit cast-to-destination is fp32->fp32 = no-op. The fp32 LoRA-merged
+    # weights are preserved exactly.
     pi0_model.load_state_dict(all_params, strict=False)
 
     if precision == "float32":
