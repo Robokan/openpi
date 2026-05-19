@@ -106,13 +106,26 @@ def main():
     noise_np = np.random.randn(1, horizon, adim).astype(np.float32)
     noise_pt = torch.from_numpy(noise_np).to(device).to(pt_dtype)
 
-    print(f"  running 10-step diffusion (action_in_proj dtype={pt_dtype})...")
-    t0 = time.time()
+    n_warmup = int(os.environ.get("DIAG_WARMUP", "1"))
+    n_iters = int(os.environ.get("DIAG_ITERS", "3"))
+    print(f"  running 10-step diffusion (warmup={n_warmup}, iters={n_iters}, action_in_proj dtype={pt_dtype})...")
     with torch.no_grad():
-        actions = pt_model.sample_actions(device, pt_obs, noise=noise_pt, num_steps=10)
-    dt = time.time() - t0
+        for _ in range(n_warmup):
+            _ = pt_model.sample_actions(device, pt_obs, noise=noise_pt, num_steps=10)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        times = []
+        for _ in range(n_iters):
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t0 = time.time()
+            actions = pt_model.sample_actions(device, pt_obs, noise=noise_pt, num_steps=10)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            times.append(time.time() - t0)
+    dt = float(np.median(times))
     actions_np = actions.detach().float().cpu().numpy()
-    print(f"  done in {dt*1000:.0f}ms")
+    print(f"  iters={[round(t*1000) for t in times]}ms  median={dt*1000:.0f}ms")
 
     un = policy._output_transform({"state": np.asarray(inputs["state"]), "actions": actions_np[0]})
     actions_un = np.asarray(un["actions"])

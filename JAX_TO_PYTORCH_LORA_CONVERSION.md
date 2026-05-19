@@ -306,30 +306,91 @@ work easier.
 
 ---
 
-## 7. Map for future quantization work
+## 7. Quantization (FP8 / NVFP4) — IMPLEMENTED via torchao
 
-The LoRA application now lives in one file: `lora_runtime.py`. For FP8/FP4
-the natural pattern is:
+Runtime quantization is now wired in `src/openpi/models_pytorch/quant_runtime.py`,
+selected via `OPENPI_PT_QUANT={fp8_w,fp8_wa,nvfp4}`. It applies AFTER the
+precision cast and BEFORE runtime LoRA install, so the patched `Linear.forward`
+dispatches through the quantized base GEMM, then adds the unquantized LoRA
+contribution (QLoRA pattern).
 
-- **Base weights → low precision (FP8 / FP4)** via Transformer Engine,
-  TensorRT-LLM, or bitsandbytes 4-bit Linear.
-- **LoRA `lora_a` / `lora_b` stay in fp16 or bf16.**
-  They're tiny (rank ≤ 32) and the LoRA contribution is small enough that
-  quantizing it loses accuracy fast (this is the standard QLoRA recipe).
-- **Patched forward stays the same.** `base_forward(x)` calls into the
-  quantized backend; `+ scaling * (x @ la) @ lb` is fp16/bf16. The two
-  results add at the higher precision.
+### Measured parity on `pi05_openarm_ngc_lora_v4` (10-step diffusion, compile on)
 
-Concretely we'd modify `install_runtime_lora` to:
-1. Replace each LoRA-targeted `nn.Linear` with a `te.Linear` / `bnb.Linear4bit`
-   pre-conversion, OR quantize in-place after load.
-2. Keep the existing einsum-based LoRA forward unchanged.
-3. Add an explicit dtype promotion at the add: `base_out.float() + lora_out.float()`
-   to avoid catastrophic mantissa loss at fp8.
+| Mode | torchao config | Raw cos vs fp32 | Post-unnorm cos | Mag ratio | Latency | Speedup |
+|---|---|---|---|---|---|---|
+| baseline (bf16 + LoRA + compile) | — | 1.0 | 1.0 | 1.000 | **326 ms** | 1.00× |
+| `fp8_w` | `Float8WeightOnlyConfig` | 0.99996 | 0.99984 | 0.987 | 829 ms | 0.39× (compile can't fuse dequant) |
+| `fp8_wa` | `Float8DynamicActivationFloat8WeightConfig` | 0.99996 | **0.99975** | **1.002** | **314 ms** | **1.04×** |
+| `nvfp4` | `NVFP4InferenceConfig` (prototype) | 0.999 | 0.9906 | 0.936 | **209 ms** | **1.56×** |
 
-If we need TensorRT engine builds, we'd export the *base* model only (no
-LoRA) to ONNX/TRT, then apply LoRA in a thin PyTorch wrapper around the
-TRT engine. Same separation; the merge stays out of the engine.
+### Targets
+Quantization is applied to `q/k/v/o/gate/up/down_proj` inside Gemma's
+`.layers.N.self_attn` and `.layers.N.mlp` (regex `_PROJ_RE` in
+`quant_runtime.py`). We skip:
+- `lm_head` (tied to embed_tokens — quantizing breaks tying)
+- `embed_tokens` (Embedding, not Linear)
+- `multi_modal_projector`, action heads, time MLPs (tiny)
+- SigLIP vision tower (untested; modest size)
+
+### Why it composes cleanly with runtime LoRA
+torchao's `quantize_` swaps the `.weight` Parameter for a tensor subclass
+(`Float8Tensor`, `NVFP4Tensor`, …) but **does not replace the `nn.Linear`
+module** or its `forward`. The patched LoRA forward calls
+`nn.Linear.forward(module, x)`, which calls `F.linear(x, self.weight, …)`,
+which dispatches through the subclass to the quantized GEMM. LoRA `lora_a`
+/ `lora_b` are registered as buffers, so the parameter walk skips them.
+
+### Why `fp8_w` is slower with compile
+Weight-only FP8 stores the weight as FP8 but matmuls in bf16. Under
+`max-autotune`, the compiler emits a dequant kernel followed by a bf16
+GEMM — two kernel launches per Linear, no fusion. Result: 829 ms vs 326 ms
+baseline. The mode is still useful for **memory** savings on weight-heavy
+models, just not for latency.
+
+### Why `nvfp4` loses 6.4% magnitude
+torchao's `NVFP4InferenceConfig` uses absmax per-block scaling without
+calibration. The action expert produces small, structured outputs where
+absmax overestimates outliers and quantizes the signal too coarsely. The
+fix is **calibrated scales**, either:
+- modelopt's `mtq.quantize` with `forward_loop` over real openarm samples
+  (already implemented in `openpi_on_thor/pytorch_to_onnx.py:quantize_model`
+  but that path strips LoRA), OR
+- AWQ / GPTQ via torchao's `quantize_` with a calibration hook.
+
+### Why `nvfp4` requires bf16
+torchao raises:
+> RuntimeError: Bias is not supported when module weight is in fp32
+
+`install_nvfp4` casts targeted module weights to bf16 before quantizing.
+This is a torchao 0.13 limitation; later versions may relax it.
+
+### Critical ordering inside `policy_config.create_trained_policy`
+```
+1. load_pytorch        (loads safetensors with assign=True, re-ties embed_tokens,
+                        installs runtime LoRA via patched forward)
+2. precision cast      (to_bfloat16_for_selected_params)
+3. quantization        (torchao.quantize_; replaces base weight tensors)
+4. compile             (already wrapped in pi0_pytorch.__init__)
+```
+
+If quantization runs BEFORE the precision cast, the cast tries to `.to(bf16)`
+a Float8Tensor / NVFP4Tensor and either errors or silently dequantizes.
+If quantization runs AFTER LoRA install, the LoRA forward patches dispatch
+through the now-quantized base — exactly what we want.
+
+### Production recommendation
+- **`fp8_wa`** is the safe default: ≤0.25% post-unnorm error, ≥1.04× speedup,
+  no calibration needed. Equivalent to fp32 quality on this task.
+- **`nvfp4`** is 1.56× faster but currently has 6.4% magnitude shrinkage
+  post-unnormalization. Needs calibration before robot deployment — same
+  risk profile as the LoRA bug we just fixed.
+
+### TensorRT engine path (separate, not LoRA-aware yet)
+`openpi_on_thor/` already has a modelopt → ONNX → trtexec pipeline that's
+faster than torchao but the patched `_load_pytorch_patched` strips LoRA
+re-tying and does not load `lora.safetensors`. To unify: factor LoRA into a
+thin PT wrapper around the TRT engine — engine does base GEMM, wrapper
+does `+ scaling * (x @ la) @ lb`.
 
 ---
 
