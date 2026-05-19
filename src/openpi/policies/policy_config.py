@@ -62,6 +62,15 @@ def create_trained_policy(
             raise ValueError(f"OPENPI_PYTORCH_PRECISION must be 'bfloat16' or 'float32', got {pt_precision!r}")
         logging.info(f"Casting PyTorch model to {pt_precision}")
         model.paligemma_with_expert.to_bfloat16_for_selected_params(pt_precision)
+
+        # Apply optional quantization AFTER the precision cast so torchao's
+        # tensor-subclass weights are not stripped by the cast. Composes with
+        # runtime LoRA: base Linear -> FP8/NVFP4, LoRA -> bf16 (additive).
+        quant_mode = os.environ.get("OPENPI_PT_QUANT", "").strip()
+        if quant_mode:
+            from openpi.models_pytorch import quant_runtime  # noqa: PLC0415
+            n = quant_runtime.install_quantization(model, quant_mode)
+            logging.info(f"Quantization installed: mode={quant_mode}, modules={n}")
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
