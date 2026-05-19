@@ -12,6 +12,40 @@ end-to-end actions after 10 diffusion steps + Unnormalize show consistent
 
 ---
 
+## ★ ★ ★ 2026-05-19 RESOLVED: Bug #2 fixed via runtime LoRA ★ ★ ★
+
+After ruling out bf16 LoRA-intermediate rounding as a sufficient
+explanation (it gives perpendicular noise, not magnitude bias), we
+implemented **runtime LoRA in PyTorch** — never pre-merge LoRA into
+base weights; instead apply `base_out + scaling * (x @ la) @ lb` on
+every forward pass, matching JAX's two-matmul order exactly.
+
+### Files added/modified
+- NEW: `src/openpi/models_pytorch/lora_runtime.py` — `install_runtime_lora()` patches each q_proj/k_proj/v_proj/o_proj/gate_proj/up_proj/down_proj's forward to add LoRA via einsum.
+- `examples/convert_jax_model_to_pytorch.py` — `OPENPI_PT_RUNTIME_LORA=1` skips merging, emits `lora.safetensors` alongside `model.safetensors` with PT-named tensors.
+- `src/openpi/models/model.py:load_pytorch` — auto-loads `lora.safetensors` if present, calls `install_runtime_lora()`.
+
+### Results (10-step diffusion, `pi05_openarm_ngc_lora_v4`)
+
+| Variant | raw cos | raw ratio | post-unnorm cos | post-unnorm ratio |
+|---|---|---|---|---|
+| Pre-merge bf16 (broken) | 0.996 | **0.918** | — | **0.918** (8% bias) |
+| Pre-merge fp32 (FIXED ckpt) | 0.996 | **0.918** | — | **0.918** |
+| Runtime LoRA, bf16 inference | +0.999992 | 0.9995 | +0.999972 | 0.9928 (0.7%) |
+| **Runtime LoRA, fp32 inference** | **+0.999997** | **1.0001** | **+0.999988** | **0.9974 (0.26%)** |
+
+The 8% magnitude bias dropped to **0.26%** post-unnormalization in fp32
+mode (well within bf16 quantization noise from JAX-side). The remaining
+residual is fundamentally bf16 quantization in JAX's 10-step Euler loop
+and cannot be reduced further without running JAX in fp32 too.
+
+### Deployed
+- `/app/checkpoints/pi05_openarm_ngc_lora_v4/chocolate_bars_pi05_pytorch` now points at the runtime-LoRA checkpoint (old one renamed to `..._PRE_RUNTIME_LORA`).
+- Server restarted with `OPENPI_PYTORCH_PRECISION=float32` (fp32 inference, even tighter parity).
+- 252 LoRA modules patched (18 layers × 7 modules × 2 experts).
+
+---
+
 ## ★ KEY 2026-05-18 FINDINGS
 
 ### Confirmed: bug is LoRA-related, not base model

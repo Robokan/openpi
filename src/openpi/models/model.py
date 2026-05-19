@@ -242,6 +242,8 @@ class BaseModelConfig(abc.ABC):
 
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
+        import os  # noqa: PLC0415
+        from openpi.models_pytorch import lora_runtime  # noqa: PLC0415
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
         # Use load_file + load_state_dict(strict=False, assign=True) instead of
         # safetensors.torch.load_model because:
@@ -291,6 +293,18 @@ class BaseModelConfig(abc.ABC):
             logger.info("Re-tied gemma_expert embed_tokens.weight to lm_head.weight after assign=True load.")
         except AttributeError as e:
             logger.warning(f"Could not re-tie gemma_expert embed_tokens to lm_head: {e}")
+
+        # Runtime LoRA: if `lora.safetensors` sits alongside the base checkpoint,
+        # the LoRA tensors were stored separately at conversion time. Load them
+        # and patch the projection forwards to apply LoRA at runtime (matching
+        # JAX's two-matmul order exactly). This avoids the bf16 quantization
+        # noise introduced by pre-merging LoRA into base weights.
+        lora_path = os.path.join(os.path.dirname(weight_path), "lora.safetensors")
+        if os.path.exists(lora_path):
+            logger.info(f"Loading runtime-LoRA tensors from {lora_path}")
+            lora_sd = safetensors.torch.load_file(lora_path)
+            n = lora_runtime.install_runtime_lora(model, lora_sd)
+            logger.info(f"Runtime LoRA installed on {n} projection modules.")
 
         return model
 

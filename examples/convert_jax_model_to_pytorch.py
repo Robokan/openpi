@@ -393,6 +393,106 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
     return final_state_dict
 
 
+def _extract_lora_pt(
+    flat_params: dict,
+    *,
+    paligemma_num_layers: int = 18,
+    paligemma_num_heads: int = 8,
+    paligemma_head_dim: int = 256,
+    paligemma_scaling: float = 1.0,
+    expert_num_layers: int = 18,
+    expert_num_heads: int = 8,
+    expert_head_dim: int = 256,
+    expert_scaling: float = 1.0,
+) -> tuple[dict, dict]:
+    """Extract JAX LoRA tensors into PT-named runtime-LoRA form.
+
+    Returns:
+      (flat_params_without_lora, pt_lora_dict)
+
+    `pt_lora_dict` keys follow the convention:
+      "paligemma_with_expert.paligemma.model.language_model.layers.{i}.self_attn.q_proj.lora_a"
+      "...q_proj.lora_b"
+      "...q_proj.lora_scaling"  (scalar tensor)
+    and similar for k_proj/v_proj/o_proj/gate_proj/up_proj/down_proj on both
+    paligemma and gemma_expert subtrees.
+
+    Tensor shapes are documented in `src/openpi/models_pytorch/lora_runtime.py`.
+    For o_proj specifically we pre-sum lora_b across the N (head) axis in fp32
+    so the runtime can do a single (B,T,L) @ (L,D) matmul — this matches
+    JAX's einsum semantics where the unmatched N axis is implicitly summed.
+    """
+    f = dict(flat_params)
+    pt_lora: dict = {}
+
+    def _pop(k):
+        if k in f:
+            return f.pop(k)
+        return None
+
+    def _add(pt_path: str, la: np.ndarray, lb: np.ndarray, scaling: float):
+        pt_lora[f"{pt_path}.lora_a"] = la.astype(np.float32)
+        pt_lora[f"{pt_path}.lora_b"] = lb.astype(np.float32)
+        pt_lora[f"{pt_path}.lora_scaling"] = np.float32(scaling)
+
+    has_paligemma_lora = "llm/layers/attn/q_einsum/lora_a" in f
+    has_expert_lora = "llm/layers/attn/q_einsum_1/lora_a" in f
+
+    if has_paligemma_lora:
+        q_la = _pop("llm/layers/attn/q_einsum/lora_a")  # (L, N, D, R)
+        q_lb = _pop("llm/layers/attn/q_einsum/lora_b")  # (L, N, R, H)
+        kv_la = _pop("llm/layers/attn/kv_einsum/lora_a")  # (L, 2, 1, D, R)
+        kv_lb = _pop("llm/layers/attn/kv_einsum/lora_b")  # (L, 2, 1, R, H)
+        o_la = _pop("llm/layers/attn/attn_vec_einsum/lora_a")  # (L, N, H, R)
+        o_lb = _pop("llm/layers/attn/attn_vec_einsum/lora_b")  # (L, N, R, D)
+        mlp_g_la = _pop("llm/layers/mlp/gating_einsum_lora_a")  # (L, 2, D, R)
+        mlp_g_lb = _pop("llm/layers/mlp/gating_einsum_lora_b")  # (L, 2, R, I)
+        mlp_l_la = _pop("llm/layers/mlp/linear_lora_a")  # (L, I, R)
+        mlp_l_lb = _pop("llm/layers/mlp/linear_lora_b")  # (L, R, D)
+
+        s = paligemma_scaling
+        pg_base = "paligemma_with_expert.paligemma.model.language_model.layers"
+        for i in range(paligemma_num_layers):
+            _add(f"{pg_base}.{i}.self_attn.q_proj", q_la[i], q_lb[i], s)  # (N, D, R), (N, R, H)
+            _add(f"{pg_base}.{i}.self_attn.k_proj", kv_la[i, 0, 0], kv_lb[i, 0, 0], s)  # (D, R), (R, H)
+            _add(f"{pg_base}.{i}.self_attn.v_proj", kv_la[i, 1, 0], kv_lb[i, 1, 0], s)
+            # o_proj: la (N, H, R) -> (N*H, R); lb (N, R, D) -> (R, D) via sum over N
+            o_la_flat = o_la[i].reshape(-1, o_la[i].shape[-1])  # (N*H, R)
+            o_lb_summed = o_lb[i].sum(axis=0)  # (R, D)
+            _add(f"{pg_base}.{i}.self_attn.o_proj", o_la_flat, o_lb_summed, s)
+            _add(f"{pg_base}.{i}.mlp.gate_proj", mlp_g_la[i, 0], mlp_g_lb[i, 0], s)  # (D, R), (R, I)
+            _add(f"{pg_base}.{i}.mlp.up_proj", mlp_g_la[i, 1], mlp_g_lb[i, 1], s)
+            _add(f"{pg_base}.{i}.mlp.down_proj", mlp_l_la[i], mlp_l_lb[i], s)  # (I, R), (R, D)
+
+    if has_expert_lora:
+        q_la = _pop("llm/layers/attn/q_einsum_1/lora_a")
+        q_lb = _pop("llm/layers/attn/q_einsum_1/lora_b")
+        kv_la = _pop("llm/layers/attn/kv_einsum_1/lora_a")
+        kv_lb = _pop("llm/layers/attn/kv_einsum_1/lora_b")
+        o_la = _pop("llm/layers/attn/attn_vec_einsum_1/lora_a")
+        o_lb = _pop("llm/layers/attn/attn_vec_einsum_1/lora_b")
+        mlp_g_la = _pop("llm/layers/mlp_1/gating_einsum_lora_a")
+        mlp_g_lb = _pop("llm/layers/mlp_1/gating_einsum_lora_b")
+        mlp_l_la = _pop("llm/layers/mlp_1/linear_lora_a")
+        mlp_l_lb = _pop("llm/layers/mlp_1/linear_lora_b")
+
+        s = expert_scaling
+        ex_base = "paligemma_with_expert.gemma_expert.model.layers"
+        for i in range(expert_num_layers):
+            _add(f"{ex_base}.{i}.self_attn.q_proj", q_la[i], q_lb[i], s)
+            _add(f"{ex_base}.{i}.self_attn.k_proj", kv_la[i, 0, 0], kv_lb[i, 0, 0], s)
+            _add(f"{ex_base}.{i}.self_attn.v_proj", kv_la[i, 1, 0], kv_lb[i, 1, 0], s)
+            o_la_flat = o_la[i].reshape(-1, o_la[i].shape[-1])
+            o_lb_summed = o_lb[i].sum(axis=0)
+            _add(f"{ex_base}.{i}.self_attn.o_proj", o_la_flat, o_lb_summed, s)
+            _add(f"{ex_base}.{i}.mlp.gate_proj", mlp_g_la[i, 0], mlp_g_lb[i, 0], s)
+            _add(f"{ex_base}.{i}.mlp.up_proj", mlp_g_la[i, 1], mlp_g_lb[i, 1], s)
+            _add(f"{ex_base}.{i}.mlp.down_proj", mlp_l_la[i], mlp_l_lb[i], s)
+
+    print(f"  Extracted {len(pt_lora)} LoRA tensors (paligemma={has_paligemma_lora}, expert={has_expert_lora})")
+    return f, pt_lora
+
+
 def _merge_lora_into_base(flat_params: dict, scaling: float = 1.0) -> dict:
     """Merge LoRA delta weights into their base weight tensors and drop the LoRA keys.
 
@@ -465,16 +565,22 @@ def slice_initial_orbax_checkpoint(checkpoint_dir: str, restore_precision: str |
     )
 
     paligemma_flat = traversals.flatten_mapping(params["PaliGemma"], sep="/")
-    # CRITICAL: merge LoRA deltas into base weights before slicing, otherwise the
-    # PyTorch checkpoint will contain only the un-fine-tuned base model.
-    # `OPENPI_CONV_LORA_SCALING` env var lets us override scaling for ablation:
-    # set to "0" to produce a base-only PT model (LoRA contribution zeroed),
-    # which we can compare against JAX-with-lora-zeroed to isolate whether the
-    # PT-vs-JAX parity bug is in the base model code or in the LoRA conversion.
+    # `OPENPI_PT_RUNTIME_LORA=1` keeps LoRA tensors separate from base weights
+    # for runtime-LoRA application in PyTorch (matches JAX two-matmul order
+    # exactly, no bf16 merge-precision loss). Default behavior pre-merges
+    # LoRA into base weights for backwards compatibility.
+    # `OPENPI_CONV_LORA_SCALING` overrides scaling for ablation (e.g. set to 0
+    # to produce a base-only PT model with no LoRA contribution).
     import os as _os  # noqa: PLC0415
     _scaling = float(_os.environ.get("OPENPI_CONV_LORA_SCALING", "1.0"))
-    paligemma_flat = _merge_lora_into_base(paligemma_flat, scaling=_scaling)
-    return {"paligemma_params": paligemma_flat, "projection_params": params}
+    _runtime_lora = _os.environ.get("OPENPI_PT_RUNTIME_LORA", "0").lower() in ("1", "true", "yes")
+    pt_lora: dict = {}
+    if _runtime_lora:
+        paligemma_flat, pt_lora = _extract_lora_pt(paligemma_flat, paligemma_scaling=_scaling, expert_scaling=_scaling)
+        print(f"  RUNTIME LoRA mode: kept LoRA separate ({len(pt_lora)} PT tensors), base weights left unmerged")
+    else:
+        paligemma_flat = _merge_lora_into_base(paligemma_flat, scaling=_scaling)
+    return {"paligemma_params": paligemma_flat, "projection_params": params, "pt_lora": pt_lora}
 
 
 def load_jax_model_and_print_keys(checkpoint_dir: str):
@@ -625,6 +731,21 @@ def convert_pi0_checkpoint(
 
     # Save model weights as SafeTensors using save_model to handle tied weights
     safetensors.torch.save_model(pi0_model, os.path.join(output_path, "model.safetensors"))
+
+    # If runtime-LoRA mode is active, also save the LoRA tensors separately
+    # alongside the base safetensors. They are loaded at inference time by
+    # `lora_runtime.install_runtime_lora` which patches the projection forwards.
+    pt_lora = initial_params.get("pt_lora", {})
+    if pt_lora:
+        lora_tensors = {}
+        for k, v in pt_lora.items():
+            t = torch.from_numpy(np.ascontiguousarray(v)) if isinstance(v, np.ndarray) else torch.as_tensor(v)
+            if precision == "bfloat16" and t.dtype == torch.float32:
+                t = t.to(torch.bfloat16)
+            lora_tensors[k] = t
+        lora_path = os.path.join(output_path, "lora.safetensors")
+        safetensors.torch.save_file(lora_tensors, lora_path)
+        print(f"  Saved {len(lora_tensors)} runtime-LoRA tensors to {lora_path}")
 
     # Copy assets folder if it exists
     assets_source = pathlib.Path(checkpoint_dir).parent / "assets"
