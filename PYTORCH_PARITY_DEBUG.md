@@ -78,6 +78,91 @@ remains.
   - "LoRA effect" (PT):        ~9.4
   - PT effect / JAX effect:    ~80%
 
+### ★ 2026-05-19 FINDINGS — bias localized to PaliGemma 18-layer forward
+
+#### Layer-by-layer KV cache divergence
+
+`scripts/diag_per_step_lora.py` compares JAX and PT KV cache values for
+prefix tokens across paligemma layers. The bias accumulates monotonically:
+
+| Layer | K cos | K ratio | V cos | V ratio |
+|-------|-------|---------|-------|---------|
+| 0     | 0.99996 | 1.0005 | 0.99996 | 1.0009 |
+| 1     | 0.99991 | 0.9989 | 0.99978 | 0.9949 |
+| 5     | 0.99945 | 0.9967 | 0.99822 | 0.9952 |
+| 9     | 0.99806 | 1.0080 | 0.99252 | 1.0046 |
+| 13    | 0.99375 | 1.0154 | 0.97535 | 1.0271 |
+| 17    | 0.98362 | 1.0163 | 0.98408 | 1.0507 |
+
+PT V at the final paligemma layer is **+5.0% LARGER** than JAX V. The
+divergence is ~0.3% per layer, consistent with a small bias amplified
+through 18 residual stacks.
+
+`suffix_out` (final gemma_expert output BEFORE action_out_proj):
+- cos = 0.9946, ratio = 0.9924 (PT 0.8% SMALLER)
+
+`v_t` (after action_out_proj):
+- cos = 0.9991, ratio = 0.9842 (PT 1.6% smaller per step → 8% per chunk)
+
+#### Ruled out (with diagnostic scripts)
+
+- **embed_prefix differences**: injecting JAX's prefix tokens into PT's
+  `compute_prefix_kv_cache` produces THE SAME bias pattern. Confirmed
+  the bug is in the 18-layer paligemma forward, not embedding.
+- **Custom KV cache code**: fast path (compute_prefix_kv_cache +
+  denoise_step_with_cache) vs slow joint-forward path (`OPENPI_PT_NO_KVCACHE=1`)
+  give IDENTICAL results (cos=1.0). So the bug is not in our manual
+  layer walking — it's in the layer modules themselves.
+- **RoPE**: `scripts/diag_rope_parity.py` — direct JAX `_apply_rope` vs
+  PT `apply_rotary_pos_emb` on identical Q, positions: cos=1.0000000,
+  max|diff|=2e-6.
+- **Single matmul (q_proj LoRA-merged vs runtime-applied)**: cos=1.0,
+  ratio=1.0 in fp32 and ~1.0 in bf16. The merge math is exact.
+- **Runtime weights**: `scripts/diag_runtime_weights.py` confirms PT
+  loaded weights equal JAX `base + scaling*(la@lb)` to bf16 precision
+  (cos=1.0, ratio=1.0) for all checked attention and MLP weights.
+- **Precision (bf16 vs fp32)**: `scripts/diag_jax_fp32_vs_pt_fp32.py`
+  forces PT to fp32 (`OPENPI_PYTORCH_PRECISION=float32`). The bias is
+  IDENTICAL: cos=0.9957, ratio=0.9182. So precision is definitively
+  ruled out.
+- **action_out_proj**: the bias is already present in `suffix_out`
+  BEFORE this projection (cos=0.9946, ratio=0.9924).
+
+#### Reviewed code in `src/openpi/models_pytorch/`
+
+Found no obvious algorithmic bug in:
+- `pi0_pytorch.py` — embed_prefix, embed_suffix, compute_prefix_kv_cache,
+  denoise_step_with_cache all match JAX semantics on paper
+- `gemma_pytorch.py` — PaliGemmaWithExpertModel, fp32_attention all match
+  JAX semantics on paper
+- `preprocessing_pytorch.py` — image preprocessing same in inference mode
+- `transformers_replace/models/gemma/modeling_gemma.py` — customized
+  GemmaRMSNorm, GemmaDecoderLayer, apply_rotary_pos_emb match JAX exactly
+- `transformers_replace/models/paligemma/modeling_paligemma.py` —
+  multi_modal_projector is just a linear layer, matches JAX
+
+#### Open hypothesis
+
+The bias is purely structural in how the 18-layer PaliGemma forward
+accumulates contributions. Even with **identical fp32 weights, identical
+fp32 inputs, identical RoPE, identical attention**, PT produces a
+progressively larger residual stream than JAX. The amplification is
+roughly geometric (~0.3% per layer).
+
+Most likely culprits remaining (in order):
+1. The `_gated_residual(x, y, None) = x + y` for paligemma vs JAX's
+   `x + 1.0 * y` — should be mathematically identical, but possible
+   subtle PT broadcasting difference
+2. Some module's `.float()` cast leading to subtle precision creep
+3. A subtle bug in the **prefix attention mask shape/format** that
+   causes PT to attend slightly differently than JAX
+
+Next step suggestion: instrument JAX side to dump per-layer hidden
+state output (need to bypass `nn.scan` somehow), then directly compare
+PT layer 0 output to JAX layer 0 output for the same input. This would
+localize whether the bias starts at layer 0 (and accumulates) or
+emerges from a specific deeper layer.
+
 Tried (no effect):
   - `OPENPI_PYTORCH_PRECISION=float32` (run inference in fp32 throughout)
   - `OPENPI_PT_MATMUL_PRECISION=highest` (no TF32)
