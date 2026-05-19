@@ -385,12 +385,43 @@ through the now-quantized base — exactly what we want.
   post-unnormalization. Needs calibration before robot deployment — same
   risk profile as the LoRA bug we just fixed.
 
-### TensorRT engine path (separate, not LoRA-aware yet)
-`openpi_on_thor/` already has a modelopt → ONNX → trtexec pipeline that's
-faster than torchao but the patched `_load_pytorch_patched` strips LoRA
-re-tying and does not load `lora.safetensors`. To unify: factor LoRA into a
-thin PT wrapper around the TRT engine — engine does base GEMM, wrapper
-does `+ scaling * (x @ la) @ lb`.
+### modelopt-based quantization is INCOMPATIBLE with monkey-patched LoRA
+
+We tested `mtq.quantize(model, NVFP4_AWQ_LITE_CFG, forward_loop=...)` after
+loading the LoRA-patched model. modelopt:
+- Emitted: `UserWarning: Received a module with monkey patched forward method.
+  Dynamic converted module might not work.`
+- After calibration: raw cos=0.85, post-unnorm cos=0.53 (catastrophically bad).
+
+Root cause: modelopt's `mtq.quantize` wraps each Linear in a dynamic module
+that replaces `forward` to insert Q/DQ nodes. My LoRA patches override
+`module.forward`, so when modelopt installs its wrapper, our LoRA addition
+gets dropped (or vice versa — the order of overrides is non-deterministic).
+Either way the LoRA contribution is lost.
+
+This means modelopt and `lora_runtime.install_runtime_lora` cannot coexist.
+
+### Path forward for big speedups
+
+To get the modelopt + ONNX + TRT engine pipeline working with LoRA:
+1. **Refactor LoRA from monkey-patch to nn.Module wrapper.** Introduce
+   `LoraLinear(nn.Module)` that holds the base `nn.Linear` as a submodule
+   plus `lora_a` / `lora_b` parameters; its forward implements
+   `base(x) + scaling * (x @ la) @ lb`. modelopt sees the base Linear and
+   quantizes it normally; the LoRA add lives in `LoraLinear.forward` which
+   modelopt does not touch.
+2. **Drop-in replace** each LoRA-targeted Linear at load time:
+   ```
+   parent_module._modules[name] = LoraLinear.from_existing(linear, lora_a, lora_b, scaling)
+   ```
+3. **Calibrate** with `mtq.quantize` + openarm `forward_loop`.
+4. **Export** to ONNX (`LoraLinear` traces through cleanly).
+5. **Build** TRT engine.
+6. **Inference** wraps the engine in PyTorch — the engine sees the
+   calibrated FP8/NVFP4 base + the LoRA add already baked into the graph.
+
+For now, `quant_runtime.py` (torchao) is the only path that composes with
+runtime LoRA, and `fp8_wa` is the safe production choice.
 
 ---
 

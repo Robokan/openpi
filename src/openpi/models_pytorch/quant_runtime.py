@@ -113,10 +113,39 @@ def install_nvfp4(model: nn.Module) -> int:
     return n
 
 
-QuantMode = Literal["fp8_w", "fp8_wa", "nvfp4"]
+def install_modelopt_nvfp4_awq(model: nn.Module, calib_forward_loop) -> int:
+    """NVFP4 with AWQ-lite calibration via NVIDIA modelopt.
+
+    Unlike torchao's `NVFP4InferenceConfig` (absmax per-block), this path uses
+    Activation-aware Weight Quantization to pick per-channel scales informed
+    by the activation distribution. Required to recover accuracy on
+    outlier-sensitive layers like the action expert.
+
+    `calib_forward_loop(model)` must run a handful of representative inference
+    samples through the model to accumulate activation statistics. See
+    `openpi_on_thor/calibration_data_openarm.py` for the openarm sampler.
+    """
+    import modelopt.torch.quantization as mtq
+
+    n = _safety_check(model)
+    logger.info(f"modelopt NVFP4 AWQ-lite: targeting {n} Linear modules; running calibration")
+    cfg = mtq.NVFP4_AWQ_LITE_CFG  # NVFP4 W4A4 with AWQ-lite per-channel scales
+
+    # Restrict the targets via wildcard match on FQN. modelopt's wildcard
+    # syntax matches against the module's full qualified name.
+    cfg["quant_cfg"]["*"] = {"enable": False}
+    cfg["quant_cfg"]["*self_attn.*_proj.weight_quantizer"] = {"enable": True}
+    cfg["quant_cfg"]["*self_attn.*_proj.input_quantizer"]  = {"enable": True}
+    cfg["quant_cfg"]["*mlp.*_proj.weight_quantizer"]       = {"enable": True}
+    cfg["quant_cfg"]["*mlp.*_proj.input_quantizer"]        = {"enable": True}
+    mtq.quantize(model, cfg, forward_loop=calib_forward_loop)
+    return n
 
 
-def install_quantization(model: nn.Module, mode: QuantMode) -> int:
+QuantMode = Literal["fp8_w", "fp8_wa", "nvfp4", "nvfp4_awq"]
+
+
+def install_quantization(model: nn.Module, mode: QuantMode, calib_forward_loop=None) -> int:
     """Entry point dispatched from `OPENPI_PT_QUANT`."""
     if mode == "fp8_w":
         return install_fp8_weight_only(model)
@@ -124,4 +153,8 @@ def install_quantization(model: nn.Module, mode: QuantMode) -> int:
         return install_fp8_dynamic(model)
     if mode == "nvfp4":
         return install_nvfp4(model)
-    raise ValueError(f"Unknown OPENPI_PT_QUANT mode: {mode!r} (choose fp8_w / fp8_wa / nvfp4)")
+    if mode == "nvfp4_awq":
+        if calib_forward_loop is None:
+            raise ValueError("nvfp4_awq requires a calibration forward loop")
+        return install_modelopt_nvfp4_awq(model, calib_forward_loop)
+    raise ValueError(f"Unknown OPENPI_PT_QUANT mode: {mode!r} (choose fp8_w / fp8_wa / nvfp4 / nvfp4_awq)")
