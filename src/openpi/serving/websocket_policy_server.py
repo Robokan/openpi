@@ -107,12 +107,16 @@ class WebsocketPolicyServer:
                 action = self._policy.infer(obs)
                 infer_time = time.monotonic() - infer_time
                 
-                # Log detailed timing every 50 requests
+                # Log detailed timing. Interval controlled by OPENPI_TIMING_LOG_INTERVAL
+                # (default 10; set to 1 for per-call). recv=robot idle between polls
+                # (not bandwidth), infer=pure model forward.
                 if not hasattr(self, '_req_count'):
                     self._req_count = 0
                 self._req_count += 1
-                if self._req_count % 50 == 0:
-                    print(f"[SERVER-TIMING] recv={recv_time*1000:.1f}ms unpack={unpack_time*1000:.1f}ms "
+                import os as _os  # noqa: PLC0415
+                _interval = int(_os.environ.get("OPENPI_TIMING_LOG_INTERVAL", "10"))
+                if self._req_count % _interval == 0:
+                    print(f"[SERVER-TIMING] #{self._req_count} recv={recv_time*1000:.1f}ms unpack={unpack_time*1000:.1f}ms "
                           f"decode={decode_time*1000:.1f}ms infer={infer_time*1000:.1f}ms "
                           f"data_size={len(raw_data)/1024:.1f}KB", flush=True)
 
