@@ -43,6 +43,45 @@ def fp32_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
     return out.to(orig_dtype)
 
 
+def fast_attention(
+    query: torch.Tensor,
+    key_unexpanded: torch.Tensor,
+    value_unexpanded: torch.Tensor,
+    additive_mask_4d: torch.Tensor | None,
+    scaling: float,
+) -> torch.Tensor:
+    """Fast SDPA-based attention with native GQA support (PyTorch 2.5+).
+
+    Designed as a drop-in for `fp32_attention` on the KV-cache fast path
+    when JAX parity is not required at the attention-logit precision level.
+    Used by TurboPi to get a 2-3x speedup on Jetson Thor.
+
+    Differences vs `fp32_attention`:
+    - bf16 logits/softmax (no fp32 cast). Acceptable when seq is short or
+      we don't need to bit-match JAX.
+    - K, V are passed UN-expanded (i.e. with num_kv_heads, not num_attn_heads);
+      SDPA's `enable_gqa=True` handles the repeat natively without a memcpy.
+    - When `additive_mask_4d is None`, SDPA picks its fastest backend
+      (Flash / Cudnn / Mem-efficient). With mask, falls back to math backend.
+
+    Args:
+        query: (B, H_q, T, D) - num_attention_heads.
+        key_unexpanded:   (B, H_kv, S, D).
+        value_unexpanded: (B, H_kv, S, D).
+        additive_mask_4d: (B, 1, T, S) additive float mask, or None to skip.
+        scaling: 1/sqrt(head_dim).
+
+    Returns:
+        (B, H_q, T, D) in query.dtype.
+    """
+    return torch.nn.functional.scaled_dot_product_attention(
+        query, key_unexpanded, value_unexpanded,
+        attn_mask=additive_mask_4d,
+        scale=scaling,
+        enable_gqa=True,
+    )
+
+
 class PaliGemmaWithExpertModel(nn.Module):
     def __init__(
         self,

@@ -73,7 +73,12 @@ def _load_obs():
 
 def main():
     quant_mode = os.environ.get("OPENPI_PT_QUANT", "").strip() or "fp32"
-    label = "fp32 baseline" if quant_mode == "fp32" else f"quant={quant_mode}"
+    fast_attn = os.environ.get("OPENPI_PT_FAST_ATTN", "1")
+    is_baseline_run = quant_mode == "fp32" and fast_attn == "0" and "DIAG_BASELINE" in os.environ
+    label_extras = []
+    if fast_attn == "1":
+        label_extras.append("fast_attn")
+    label = "fp32 baseline" if is_baseline_run else f"quant={quant_mode}" + (" " + ",".join(label_extras) if label_extras else "")
     print("=" * 100)
     print(f"Loading PT policy: {label}")
     print("=" * 100)
@@ -130,9 +135,9 @@ def main():
     un = policy._output_transform({"state": np.asarray(inputs["state"]), "actions": actions_np[0]})
     actions_un = np.asarray(un["actions"])
 
-    if quant_mode == "fp32":
+    if is_baseline_run:
         np.savez(BASELINE_PATH, raw=actions_np, post_unnorm=actions_un, latency_ms=dt * 1000)
-        print(f"  cached fp32 baseline -> {BASELINE_PATH}")
+        print(f"  cached fp32 baseline (fp32_attention) -> {BASELINE_PATH}")
         return
 
     if not os.path.exists(BASELINE_PATH):
