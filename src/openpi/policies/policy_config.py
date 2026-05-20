@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import os
 import pathlib
@@ -39,27 +40,41 @@ def _pytorch_warmup(model, device: str, n_iters: int = 2) -> None:
             t = torch.zeros(spec.shape, dtype=torch_dtype, device=device)
         return t
 
-    pt_obs_dict = jax.tree.map(_to_torch, observation_spec)
+    # inputs_spec returns an Observation dataclass with ShapeDtypeStruct leaves;
+    # tree.map preserves that container so we get an Observation of torch tensors back.
+    observation = jax.tree.map(_to_torch, observation_spec)
     # action_in_proj.weight.dtype is the dtype the diffusion path expects on entry.
     # If the model has been cast to bf16 / quantized, all float tensors need to match.
     target_dtype = model.action_in_proj.weight.dtype
-    pt_obs_dict = jax.tree.map(
+    observation = jax.tree.map(
         lambda t: t.to(target_dtype) if (isinstance(t, torch.Tensor) and t.is_floating_point()) else t,
-        pt_obs_dict,
+        observation,
     )
-    observation = _model.Observation.from_dict(pt_obs_dict)
+    # inputs_spec gives images channels-last (N, H, W, C). The PT model expects
+    # channels-first (N, C, H, W) (Observation.from_dict normally permutes when
+    # incoming uint8 frames arrive). Replicate that here.
+    if isinstance(observation.images, dict):
+        permuted_images = {}
+        for k, v in observation.images.items():
+            if isinstance(v, torch.Tensor) and v.ndim == 4 and v.shape[-1] == 3:
+                permuted_images[k] = v.permute(0, 3, 1, 2).contiguous()
+            else:
+                permuted_images[k] = v
+        observation = dataclasses.replace(observation, images=permuted_images)
 
     horizon = model.config.action_horizon
     adim = model.config.action_dim
     _np.random.seed(0)
     noise = torch.from_numpy(_np.random.randn(1, horizon, adim).astype(_np.float32)).to(device).to(target_dtype)
 
+    import os as _os  # noqa: PLC0415
+    _num_steps = int(_os.environ.get("OPENPI_PT_NUM_STEPS", "10"))
     with torch.no_grad():
         for i in range(n_iters):
-            _ = model.sample_actions(device, observation, noise=noise, num_steps=10)
+            _ = model.sample_actions(device, observation, noise=noise, num_steps=_num_steps)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-            logging.info(f"  warmup iter {i+1}/{n_iters} complete")
+            logging.info(f"  warmup iter {i+1}/{n_iters} complete (num_steps={_num_steps})")
 
 
 def create_trained_policy(
@@ -157,6 +172,19 @@ def create_trained_policy(
             pytorch_device = "cuda" if torch.cuda.is_available() else "cpu"
         except ImportError:
             pytorch_device = "cpu"
+
+    # Allow runtime override of num_steps (diffusion iterations) via env var.
+    # Lower = faster inference, less accurate. 10 is the default; 6 is a good
+    # balance; 4 starts losing precision. Affects `infer` latency proportionally.
+    _num_steps_env = os.environ.get("OPENPI_PT_NUM_STEPS", "").strip()
+    if _num_steps_env:
+        try:
+            _num_steps = int(_num_steps_env)
+            sample_kwargs = dict(sample_kwargs or {})
+            sample_kwargs["num_steps"] = _num_steps
+            logging.info(f"Overriding diffusion num_steps={_num_steps} via OPENPI_PT_NUM_STEPS")
+        except ValueError:
+            logging.warning(f"OPENPI_PT_NUM_STEPS={_num_steps_env!r} not an int; ignoring")
 
     return _policy.Policy(
         model,

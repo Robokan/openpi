@@ -729,6 +729,171 @@ class PI0Pytorch(nn.Module):
             time += dt
         return x_t
 
+    def realtime_sample_actions(
+        self,
+        device,
+        observation,
+        prev_action_chunk: torch.Tensor,
+        inference_delay: int,
+        prefix_attention_horizon: int | None = None,
+        prefix_attention_schedule: str = "exp",
+        max_guidance_weight: float = 5.0,
+        noise: torch.Tensor | None = None,
+        num_steps: int = 10,
+    ) -> torch.Tensor:
+        """Real-Time Chunking (RTC) variant of sample_actions.
+
+        Replaces the per-step velocity field ``v_t`` with a Pi-GDM-corrected
+        velocity that pulls the chunk being generated toward
+        ``prev_action_chunk`` over the overlap region (indices
+        ``[0, prefix_attention_horizon)``), with full guidance on the first
+        ``inference_delay`` indices (the "frozen" prefix) and softly decaying
+        guidance on the remaining overlap.
+
+        See ``openpi.models_pytorch.rtc`` for the soft-mask schedule and
+        guidance-weight formula. Reference:
+        ``Physical-Intelligence/real-time-chunking-kinetix:src/model.py``.
+
+        Args:
+            prev_action_chunk: (B, H, action_dim) — the previously generated
+                chunk. The first ``inference_delay`` rows of the new chunk
+                will be guided to (approximately) match this. Rest is "soft".
+            inference_delay: ``d`` — number of timesteps that will have been
+                consumed from the previous chunk by the time this new chunk
+                is available. ``[0, d)`` is frozen (W=1); ``[d, prefix_attention_horizon)``
+                decays; ``[prefix_attention_horizon, H)`` is free (W=0).
+            prefix_attention_horizon: index past which the new chunk pays no
+                attention to the previous chunk. Defaults to
+                ``H - execute_horizon``, but typically you pass ``H - s_min``
+                directly. Must satisfy
+                ``inference_delay <= prefix_attention_horizon <= H``.
+            prefix_attention_schedule: "exp" (default, paper's recommendation),
+                "linear", "ones", or "zeros".
+            max_guidance_weight: ``beta`` from the paper (default 5.0).
+            num_steps: number of flow-matching Euler steps. Paper uses 5;
+                we default to 10 for our deployment.
+
+        Returns:
+            (B, H, action_dim) — the new, RTC-corrected action chunk.
+        """
+        # Local imports to keep the no-RTC path fast.
+        import os  # noqa: PLC0415
+        from openpi.models_pytorch import rtc as _rtc  # noqa: PLC0415
+
+        H = self.config.action_horizon
+        if prefix_attention_horizon is None:
+            prefix_attention_horizon = H  # full overlap; client should set this
+        assert 0 <= inference_delay <= H, f"{inference_delay=} must be in [0, {H}]"
+        assert (
+            inference_delay <= prefix_attention_horizon <= H
+        ), f"{inference_delay=} <= {prefix_attention_horizon=} <= {H=} violated"
+
+        bsize = observation.state.shape[0]
+        adim = self.config.action_dim
+        if noise is None:
+            noise = self.sample_noise((bsize, H, adim), device)
+
+        # 1) Encode observation once (same as vanilla sample_actions).
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
+            observation, train=False
+        )
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+
+        # KV cache is computed once and re-used across all denoising steps;
+        # it has no dependency on x_t, so we keep it under no_grad.
+        with torch.no_grad():
+            prefix_kv_cache = self.compute_prefix_kv_cache(
+                prefix_embs, prefix_pad_masks, prefix_att_masks
+            )
+
+        # 2) Soft-mask schedule (paper Eq. 5; Kinetix get_prefix_weights).
+        weights_1d = _rtc.get_prefix_weights(
+            start=inference_delay,
+            end=prefix_attention_horizon,
+            total=H,
+            schedule=prefix_attention_schedule,
+            device=device,
+            dtype=noise.dtype,
+        )  # (H,)
+        weights = weights_1d[None, :, None]  # (1, H, 1) for broadcast (B, H, D)
+
+        # Ensure prev_action_chunk dtype/device matches.
+        y = prev_action_chunk.to(device=device, dtype=noise.dtype)
+        if y.shape[0] != bsize:
+            # Allow B=1 prev chunk broadcasted across batch.
+            y = y.expand(bsize, -1, -1)
+
+        # 3) Run flow-matching Euler integration with Pi-GDM-corrected velocity.
+        # Our convention: time goes 1.0 -> 0.0 (noise -> clean), dt < 0.
+        # Paper convention: tau goes 0.0 -> 1.0 (noise -> clean), dt > 0.
+        # We compute everything in our convention internally and convert tau
+        # only for the guidance-weight formula.
+        dt = -1.0 / num_steps
+        dt_t = torch.tensor(dt, dtype=torch.float32, device=device)
+        time = torch.tensor(1.0, dtype=torch.float32, device=device)
+
+        x_t = noise
+
+        # torch.func is needed for jacobian-vector products. Available since
+        # PyTorch 2.0; we import locally to avoid the dep at module load.
+        from torch.func import vjp  # noqa: PLC0415
+
+        verbose = os.environ.get("OPENPI_PT_RTC_DEBUG", "0") == "1"
+
+        while time >= -dt / 2:
+            expanded_time = time.expand(bsize)
+
+            def denoiser(x_in: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                """Returns (x_1_hat, v_t) where x_1_hat extrapolates to clean.
+
+                In our convention (time = 1-tau_paper), the one-shot estimate
+                of the clean action is::
+
+                    x_1_hat = x_t + dt_remaining * v_t = x_t - time * v_t
+
+                because dt to reach time=0 is ``-time`` and our v_t points
+                opposite to the paper's v_t (consistent with our negative dt
+                in the integrator).
+                """
+                v = self.denoise_step_with_cache(
+                    state, prefix_kv_cache, prefix_pad_masks, x_in, expanded_time
+                )
+                v = v.to(x_in.dtype)
+                x1 = x_in - expanded_time.view(-1, 1, 1) * v
+                return x1, v
+
+            # vjp returns (x_1_hat, vjp_fn, aux=v_t)
+            x_1_hat, vjp_fn, v_t = vjp(denoiser, x_t, has_aux=True)
+
+            # Error vector with soft mask applied per-row.
+            err = (y - x_1_hat) * weights  # (B, H, D)
+            (pinv_correction,) = vjp_fn(err)  # gradient of <err, x_1_hat> w.r.t. x_t
+
+            # Guidance weight clipping.  Convert our `time` to paper's tau.
+            tau_paper = 1.0 - time
+            gw = _rtc.guidance_weight_from_time(tau_paper, max_guidance_weight=max_guidance_weight)
+
+            # Sign note: pinv_correction = vjp_fn(y - x_1_hat) returns the
+            # descent direction (= -dL/dx_t) for the loss ||W*(y - x_1_hat)||^2.
+            # The paper applies it as ``v_t + gw * pinv_correction`` followed by
+            # ``x_t += dt * v_corrected`` with dt > 0, so the step is
+            # ``+ dt * gw * pinv_correction`` (a positive descent step).
+            # In our convention dt < 0, so to get the SAME positive descent step
+            # we must SUBTRACT the correction from v_t.
+            v_corrected = v_t - gw * pinv_correction
+            x_t = x_t + dt_t * v_corrected
+            time = time + dt_t
+
+            if verbose:
+                with torch.no_grad():
+                    seam = pinv_correction[:, :inference_delay].abs().mean().item()
+                    free = pinv_correction[:, prefix_attention_horizon:].abs().mean().item()
+                    print(f"  [RTC tau={tau_paper:.3f}] gw={float(gw):.3f} |corr_prefix|={seam:.4f} |corr_free|={free:.4f}")
+
+        return x_t
+
     def denoise_step(
         self,
         state,

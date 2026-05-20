@@ -1,11 +1,17 @@
 [project]
 name = "openpi-client"
-version = "0.1.0"
+version = "0.1.1"
 requires-python = ">=3.7"
 dependencies = [
     "dm-tree>=0.1.8",
     "msgpack>=1.0.5",
-    "numpy>=1.22.4,<2.0.0",
+    # NOTE: previously pinned to numpy<2 because the openpi *server* / JAX
+    # historically required it. The CLIENT does not use JAX and works fine
+    # with numpy 2.x. Keeping the upper bound off matters in environments
+    # like the SparkJAX dev container, where opencv-python>=4.10 is already
+    # installed against numpy 2 -- installing this package used to silently
+    # downgrade numpy and break ``import cv2``.
+    "numpy>=1.22.4",
     "pillow>=9.0.0",
     "tree>=0.2.4",
     "websockets>=11.0",

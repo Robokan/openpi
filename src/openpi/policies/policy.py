@@ -22,6 +22,29 @@ BasePolicy: TypeAlias = _base_policy.BasePolicy
 
 
 class Policy(BasePolicy):
+    # Reserved keys in the observation dict that carry Real-Time Chunking
+    # (RTC) inputs. These bypass the input-transform pipeline (so the prev
+    # chunk isn't normalized again, etc.) and are routed to the model's
+    # ``realtime_sample_actions`` path.
+    #
+    # Client API:
+    #   obs["_rtc_prev_chunk"]:               np.ndarray, shape (H, action_dim_model)
+    #   obs["_rtc_inference_delay"]:          int          (d, controller timesteps consumed)
+    #   obs["_rtc_prefix_attention_horizon"]: int, optional (default = H, full overlap)
+    #   obs["_rtc_schedule"]:                 str, optional (default "exp")
+    #   obs["_rtc_max_guidance_weight"]:      float, optional (default 5.0)
+    #
+    # The server returns the next chunk plus a "_rtc_chunk_model_space" key
+    # that the client must echo back on the following inference call. See
+    # ``openpi_client.AsyncActionChunkBroker`` for the canonical client.
+    _RTC_KEYS = (
+        "_rtc_prev_chunk",
+        "_rtc_inference_delay",
+        "_rtc_prefix_attention_horizon",
+        "_rtc_schedule",
+        "_rtc_max_guidance_weight",
+    )
+
     def __init__(
         self,
         model: _model.BaseModel,
@@ -66,6 +89,14 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        # Extract RTC inputs BEFORE applying input transforms. These are not
+        # normal observation fields and must not be passed through Normalize.
+        rtc_kwargs: dict[str, Any] = {}
+        if isinstance(obs, dict):
+            for k in self._RTC_KEYS:
+                if k in obs:
+                    rtc_kwargs[k] = obs.pop(k)
+
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
@@ -89,11 +120,51 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
-        outputs = {
-            "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
-        }
+
+        # Dispatch: if the client supplied an RTC prev chunk and we're on the
+        # PyTorch path, use realtime_sample_actions. Otherwise fall through to
+        # the existing sample_actions path.
+        use_rtc = (
+            self._is_pytorch_model
+            and rtc_kwargs.get("_rtc_prev_chunk") is not None
+            and hasattr(self._model, "realtime_sample_actions")
+        )
+        if use_rtc:
+            prev = np.asarray(rtc_kwargs["_rtc_prev_chunk"], dtype=np.float32)
+            if prev.ndim == 2:
+                prev = prev[None, ...]
+            prev_t = torch.from_numpy(prev).to(self._pytorch_device)
+            d = int(rtc_kwargs.get("_rtc_inference_delay", 0))
+            pah = int(rtc_kwargs.get("_rtc_prefix_attention_horizon", self._model.config.action_horizon))
+            schedule = str(rtc_kwargs.get("_rtc_schedule", "exp"))
+            beta = float(rtc_kwargs.get("_rtc_max_guidance_weight", 5.0))
+            actions = self._model.realtime_sample_actions(
+                self._pytorch_device,
+                observation,
+                prev_action_chunk=prev_t,
+                inference_delay=d,
+                prefix_attention_horizon=pah,
+                prefix_attention_schedule=schedule,
+                max_guidance_weight=beta,
+                noise=sample_kwargs.get("noise"),
+                num_steps=sample_kwargs.get("num_steps", 10),
+            )
+        else:
+            actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+
+        outputs = {"state": inputs["state"], "actions": actions}
         model_time = time.monotonic() - start_time
+
+        # Capture the raw model-space chunk BEFORE output transforms strip /
+        # remap / unnormalize. The client needs this exact tensor as the prev
+        # chunk on the next call.
+        if self._is_pytorch_model:
+            raw_actions_model_space = (
+                np.asarray(actions[0, ...].detach().cpu()) if isinstance(actions, torch.Tensor) else np.asarray(actions[0, ...])
+            )
+        else:
+            raw_actions_model_space = np.asarray(actions[0, ...])
+
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
         else:
@@ -103,6 +174,12 @@ class Policy(BasePolicy):
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
+        # Always return the model-space chunk so the client can use RTC on
+        # the next call. (Cheap: a few KB.)
+        outputs["_rtc_chunk_model_space"] = raw_actions_model_space
+        if use_rtc:
+            outputs["_rtc_used"] = True
+            outputs["_rtc_inference_delay"] = d
         return outputs
 
     @property
