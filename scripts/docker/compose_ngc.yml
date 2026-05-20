@@ -11,11 +11,8 @@
 #   docker compose -f scripts/docker/compose_ngc.yml run --rm openpi_server_ngc \
 #       python scripts/train.py pi05_openarm --exp-name spark_v1
 #
-# For FlashRT JAX inference on DGX Spark (the post-training inference plan):
-#   docker compose -f scripts/docker/compose_ngc.yml run --rm flashrt_spark \
-#       python3 /workspace/FlashRT/scripts/spark_build_smoke.py
-#   # then for serving (after Phase 5):
-#   docker compose -f scripts/docker/compose_ngc.yml up flashrt_spark
+# Note: FlashRT inference on DGX Spark lives in the FlashRT repo, not here.
+# See FlashRT/docker/compose.spark.yml for the flashrt_spark service.
 
 services:
   # For training - uses more memory
@@ -65,75 +62,6 @@ services:
     
     # Override default command for interactive use
     # command: /bin/bash
-
-  # For FlashRT JAX inference on DGX Spark (SM_121 + aarch64).
-  # Phase 0–7 of the plan target this service:
-  #   - Phase 0: build smoke (scripts/spark_build_smoke.py)
-  #   - Phase 1: pi05_libero eval
-  #   - Phase 2-4: pi05_openarm checkpoint load + parity
-  #   - Phase 5-7: serve via flashrt server adapter
-  #
-  # The FlashRT repo is expected to be a sibling of openpi at ../FlashRT.
-  # Override FLASHRT_DIR if you check out somewhere else.
-  flashrt_spark:
-    image: flashrt:spark
-    build:
-      # Build context = FlashRT repo root, not openpi root.
-      context: ${FLASHRT_DIR:-../FlashRT}
-      dockerfile: docker/Dockerfile.spark
-      args:
-        GPU_ARCH: "121"
-        # nvcc parallelism — see Dockerfile.spark for the full rule.
-        # Quick version: BUILD_J ≈ max(2, floor((free_GB - 12) / 6)).
-        # Default 4 is safe on a Spark with desktop + Cursor + JAX running
-        # (~90 GB free). On a headless Spark, bump to 16 or 20.
-        # Override:  BUILD_J=8 docker compose -f ... build flashrt_spark
-        BUILD_J: ${BUILD_J:-4}
-    # Cap the build container's total memory so a runaway parallel
-    # compile cannot starve the host. 60 GB leaves headroom for the
-    # Grace CPU and any other processes. Mem limits at compose-build
-    # time require BuildKit and only apply during `docker build`,
-    # which is exactly what we want.
-    mem_limit: 60g
-    memswap_limit: 60g
-    init: true
-    tty: true
-    stdin_open: true
-    network_mode: host
-
-    volumes:
-      # Mount openpi so the websocket server adapter (Phase 5) and the
-      # parity harness (Phase 4) can be developed without rebuilding.
-      - $PWD:/openpi
-      # Mount FlashRT for live source edits during the port.
-      - ${FLASHRT_DIR:-../../FlashRT}:/workspace/FlashRT
-      # Mount checkpoint cache (Orbax checkpoints, calibration scales).
-      - ${OPENPI_DATA_HOME:-~/.cache/openpi}:/openpi_assets
-      # HuggingFace cache for any tokenizer/dataset access.
-      - ${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface
-      # Datasets directory for OpenArm calibration samples.
-      - ${DATASETS_DIR:-~/datasets}:/datasets
-
-    environment:
-      - OPENPI_DATA_HOME=/openpi_assets
-      - HF_HOME=/root/.cache/huggingface
-      - PYTHONPATH=/openpi/src:/workspace/FlashRT
-      - IS_DOCKER=true
-      # Unified-memory caveat: don't preallocate the whole pool —
-      # FlashRT shares LPDDR with the Grace CPU process running the
-      # robot client. 0.6 leaves ~50 GB headroom on a 128 GB Spark.
-      - XLA_PYTHON_CLIENT_MEM_FRACTION=0.6
-      - XLA_PYTHON_CLIENT_PREALLOCATE=false
-      - JAX_COMPILATION_CACHE_DIR=/openpi/.jax_cache
-      - NVIDIA_TF32_OVERRIDE=1
-
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
 
   # For PyTorch-based training (LeRobot Diffusion Policy)
   openpi_pytorch:
