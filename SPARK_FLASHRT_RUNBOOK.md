@@ -41,20 +41,112 @@ Plan reference: `~/.cursor/plans/flashrt_jax_on_dgx_spark_f0288dd4.plan.md`
 
 ## Phase 0 — Build FlashRT for SM_121 + aarch64
 
+> **Memory caveat for the build step (read first).**
+> The Spark build compiles a heavier TU set than the Thor build — FA2 in
+> 15 CUTLASS-3.x hdim×dtype×split instantiations at sm_80 + sm_120 +
+> sm_121, plus the SM120 NVFP4 W4A16 GEMM and SM120 block-128 FP8 GEMM.
+> Each of those template TUs peaks at ~5 GB of host RAM during nvcc
+> instantiation (regular kernels peak ~1–2 GB). On a headless Spark with
+> ~115 GB free, `cmake --build -j$(nproc)` (= `-j20`) is fine. But on a
+> Spark running a desktop + Cursor IDE + cached JAX runtimes
+> (~30 GB already pinned), only ~90 GB is free at build start, and
+> `-j16` × ~5 GB = a transient working set that has been observed to
+> OOM-kill the desktop session and force a hard reboot.
+>
+> The unified LPDDR pool is shared between the Grace CPU and the
+> Blackwell GPU, so when the OOM killer fires it targets the heaviest
+> CPU consumer — usually the IDE or the desktop compositor, *not* the
+> build itself. There is no helpful "build failed: out of memory"
+> error; the whole UI just freezes.
+>
+> Quick rule of thumb on Spark:
+>
+> ```
+> BUILD_J ≈ max(2, floor((free_GB_at_start - 12) / 6))
+>
+> 30 GB free → 3       60 GB free → 8       115 GB free → 17
+> ```
+>
+> Check before you build: `free -h` and `nvidia-smi --query-gpu=memory.used --format=csv`.
+>
+> The Dockerfile + compose file default to `BUILD_J=4` so the desktop
+> path is always safe. On a headless Spark, set `BUILD_J=16` or 20.
+>
+> (Thor uses `-j$(nproc)` in its Dockerfile and that works because
+> Thor's CMakeLists path *skips* FA2 entirely on SM_110 — the build is
+> 10–15 TUs of hand-written kernels, not the FA2 + CUTLASS sweep. The
+> "Spark needs less `-j` than Thor" effect is about the *build's* memory
+> footprint, not the unified-memory architecture.)
+
+### Option A — Build via Docker (recommended, reproducible)
+
 ```bash
 cd ~/sparkpack/openpi
+# Optional override: BUILD_J=2 ... build flashrt_spark
 docker compose -f scripts/docker/compose_ngc.yml build flashrt_spark
 ```
 
-This applies the CMakeLists patches that treat SM_121 like SM_120 in the
-consumer-Blackwell code paths and emits both `sm_120` and `sm_121` SASS
-for FA2. First build is 10–20 minutes (CUTLASS template codegen).
+The compose file caps the build container at 60 GB and passes
+`BUILD_J=4` to the Dockerfile. First build is ~25–40 min (NGC base
+image pull on cold cache + CUTLASS template codegen at low `-j`).
 
-**Gate**:
+### Option B — Native uv venv (faster iteration on Spark, no Docker)
+
+```bash
+cd ~/sparkpack/FlashRT
+uv venv --python 3.12 .venv
+source .venv/bin/activate
+uv pip install pybind11 ninja numpy pyyaml
+
+git clone --depth 1 --branch v4.4.2 \
+    https://github.com/NVIDIA/cutlass.git third_party/cutlass
+
+cmake -B build -S . -DGPU_ARCH=121 \
+    -DPython3_EXECUTABLE=$(which python) -G Ninja
+
+# Check free RAM and pick -j accordingly:
+#   free -h
+#   BUILD_J = max(2, floor((free_GB - 12) / 6))
+# Safe default for a Spark with desktop + Cursor running:
+cmake --build build -j4
+
+# (Skip prlimit-based per-process caps: nvcc/cicc map large virtual
+# regions for CUTLASS template specialization and a tight --as limit
+# causes spurious "cannot allocate memory" failures even when resident
+# usage is fine. The -j cap is the actual protection.)
+```
+
+Configure should print these lines if SM_121 is wired correctly:
+
+```
+-- NVFP4/W4A8 support: ENABLED (sm_121a)
+-- Using gencode flag: -gencode=arch=compute_121a,code=sm_121a
+-- FA2 in-SO attention: ENABLED (sm_121)
+-- FA2 vendor arch: sm_80 + sm_120 + sm_121 AOT + compute_120 PTX fallback (Spark default)
+```
+
+The build drops `flash_rt/flash_rt_kernels*.so` and
+`flash_rt/flash_rt_fa2*.so` into the source tree. Then make `flash_rt`
+importable for the smoke test:
+
+```bash
+uv pip install -e ".[torch,jax]"
+```
+
+### Gate (either option)
+
+Docker path:
 
 ```bash
 docker compose -f scripts/docker/compose_ngc.yml run --rm flashrt_spark \
     python3 /workspace/FlashRT/scripts/spark_build_smoke.py
+```
+
+Native path:
+
+```bash
+cd ~/sparkpack/FlashRT && source .venv/bin/activate
+python scripts/spark_build_smoke.py
 ```
 
 Exits 0 only if `get_gpu_sm_version() == 121`, `supports_nvfp4() == True`,

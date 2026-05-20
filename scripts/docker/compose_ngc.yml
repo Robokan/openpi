@@ -83,6 +83,19 @@ services:
       dockerfile: docker/Dockerfile.spark
       args:
         GPU_ARCH: "121"
+        # nvcc parallelism — see Dockerfile.spark for the full rule.
+        # Quick version: BUILD_J ≈ max(2, floor((free_GB - 12) / 6)).
+        # Default 4 is safe on a Spark with desktop + Cursor + JAX running
+        # (~90 GB free). On a headless Spark, bump to 16 or 20.
+        # Override:  BUILD_J=8 docker compose -f ... build flashrt_spark
+        BUILD_J: ${BUILD_J:-4}
+    # Cap the build container's total memory so a runaway parallel
+    # compile cannot starve the host. 60 GB leaves headroom for the
+    # Grace CPU and any other processes. Mem limits at compose-build
+    # time require BuildKit and only apply during `docker build`,
+    # which is exactly what we want.
+    mem_limit: 60g
+    memswap_limit: 60g
     init: true
     tty: true
     stdin_open: true
